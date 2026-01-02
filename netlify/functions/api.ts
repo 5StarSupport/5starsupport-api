@@ -1046,9 +1046,23 @@ function clientIp(args: { req: Request; context: Context }): string {
   if (typeof viaContext === "string" && viaContext.trim()) return viaContext.trim();
 
   const h = args.req.headers;
-  const nf = h.get("x-nf-client-connection-ip");
-  if (nf) return nf.split(",")[0].trim();
-  const xff = h.get("x-forwarded-for");
-  if (xff) return xff.split(",")[0].trim();
-  return "0.0.0.0";
+
+  const candidates = [
+    h.get("x-nf-client-connection-ip"),
+    h.get("cf-connecting-ip"),
+    h.get("true-client-ip"),
+    h.get("x-real-ip"),
+    h.get("x-forwarded-for"),
+  ].filter(Boolean) as string[];
+
+  for (const v of candidates) {
+    const ip = v.split(",")[0].trim();
+    if (ip) return ip;
+  }
+
+  // last-resort: unique-ish per client so you don’t global-rate-limit
+  const ua = h.get("user-agent") ?? "ua";
+  const origin = h.get("origin") ?? "origin";
+  return `${hashShort(`${ua}|${origin}`)}`;
 }
+
