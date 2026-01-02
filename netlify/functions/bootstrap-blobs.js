@@ -1,24 +1,21 @@
-const { getStore } = require("@netlify/blobs");
+// File: netlify/functions/bootstrap-blobs.js
+const { getDataStore, json } = require("./_utils");
 
-exports.config = {
-  name: "bootstrap-blobs"
-};
+exports.handler = async (event) => {
+  try {
+    const store = getDataStore(event);
 
-exports.handler = async () => {
-  const store = getStore("5starsupport-crm");
+    // Force-create the store by writing a key
+    await store.set("leads:index", [], { type: "json" });
 
-  await store.set(
-    "initialized",
-    {
-      createdAt: new Date().toISOString(),
-      ok: true
-    },
-    { type: "json" }
-  );
-
-  return {
-    statusCode: 200,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message: "Blob store initialized" })
-  };
+    return json(200, {
+      success: true,
+      message: "Blob store initialized",
+    });
+  } catch (err) {
+    return json(500, {
+      error: true,
+      message: err.message,
+    });
+  }
 };

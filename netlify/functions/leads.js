@@ -1,3 +1,4 @@
+// File: netlify/functions/leads.js
 const { v4: uuidv4 } = require("uuid");
 const {
   json,
@@ -10,7 +11,7 @@ const {
   writeLead,
   deleteLead,
   safeParseJson,
-  nowIso
+  nowIso,
 } = require("./_utils");
 
 function normalizeStatus(s) {
@@ -27,7 +28,6 @@ function sanitizeString(x, max = 200) {
 }
 
 function getPathParts(event) {
-  // Example:
   // /.netlify/functions/leads
   // /.netlify/functions/leads/<id>
   // /.netlify/functions/leads/<id>/status
@@ -48,29 +48,28 @@ exports.handler = async (event) => {
 
   const auth = getAuthRole(event);
   const parts = getPathParts(event);
-  const store = getDataStore();
+
+  // ✅ FIX: pass event so Netlify Blobs can initialize in Lambda compat mode
+  const store = getDataStore(event);
 
   // Permissions
   const canWebsiteCreate = auth.role === "website";
   const canCrm = auth.role === "crm_key" || auth.role === "crm_jwt";
 
-  // Helper for consistent auth failures
   const deny = () => json(401, { error: true, message: "Unauthorized" }, cors);
 
   try {
-    // ROUTE: /leads  (list or create)
+    // ROUTE: /leads (list or create)
     if (parts.length === 0) {
       if (event.httpMethod === "GET") {
         if (!canCrm) return deny();
 
         const ids = await readIndex(store);
-        // Fetch leads (simple; fine for v1)
         const leads = [];
         for (const id of ids) {
           const item = await readLead(store, id);
           if (item) leads.push(item);
         }
-        // newest first
         leads.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
         return json(200, { items: leads }, cors);
       }
@@ -96,7 +95,7 @@ exports.handler = async (event) => {
           source: canWebsiteCreate ? "website" : (sanitizeString(body.source, 40) || "crm"),
           notes: [],
           createdAt,
-          updatedAt: createdAt
+          updatedAt: createdAt,
         };
 
         if (!lead.name) {
@@ -182,7 +181,6 @@ exports.handler = async (event) => {
         const lead = await readLead(store, id);
         if (!lead) return json(404, { error: true, message: "Not found" }, cors);
 
-        // Allow updating basic fields (not id/createdAt)
         if (body.name !== undefined) lead.name = sanitizeString(body.name, 160);
         if (body.phone !== undefined) lead.phone = sanitizeString(body.phone, 60);
         if (body.email !== undefined) lead.email = sanitizeString(body.email, 120);
