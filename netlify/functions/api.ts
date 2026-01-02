@@ -568,7 +568,9 @@ async function rateLimit(
   dailyLimit: number,
 ): Promise<{ ok: true } | { ok: false }> {
   const day = nowIso().slice(0, 10);
-  const key = `ratelimit/${day}/${hashShort(ip)}`;
+
+  // IMPORTANT: bump prefix so old "0.0.0.0" counters are ignored
+  const key = `ratelimit_v2/${day}/${hashShort(ip)}`;
 
   for (let i = 0; i < 5; i += 1) {
     const existing = (await store.getWithMetadata(key, { type: "json" })) as
@@ -877,7 +879,7 @@ function readEnvSafe(): EnvConfig {
   const capacityPerSlot = clampInt(envGet("CAPACITY_PER_SLOT"), 1, 50, 1);
 
   const tz = envGet("TZ") ?? "America/Los_Angeles";
-  const publicDailyRateLimit = clampInt(envGet("PUBLIC_DAILY_RATE_LIMIT"), 1, 10_000, 200);
+  const publicDailyRateLimit = clampInt(envGet("PUBLIC_DAILY_RATE_LIMIT"), 1, 10_000, 5000);
 
   return {
     jwtSecret,
@@ -1046,23 +1048,9 @@ function clientIp(args: { req: Request; context: Context }): string {
   if (typeof viaContext === "string" && viaContext.trim()) return viaContext.trim();
 
   const h = args.req.headers;
-
-  const candidates = [
-    h.get("x-nf-client-connection-ip"),
-    h.get("cf-connecting-ip"),
-    h.get("true-client-ip"),
-    h.get("x-real-ip"),
-    h.get("x-forwarded-for"),
-  ].filter(Boolean) as string[];
-
-  for (const v of candidates) {
-    const ip = v.split(",")[0].trim();
-    if (ip) return ip;
-  }
-
-  // last-resort: unique-ish per client so you don’t global-rate-limit
-  const ua = h.get("user-agent") ?? "ua";
-  const origin = h.get("origin") ?? "origin";
-  return `${hashShort(`${ua}|${origin}`)}`;
+  const nf = h.get("x-nf-client-connection-ip");
+  if (nf) return nf.split(",")[0].trim();
+  const xff = h.get("x-forwarded-for");
+  if (xff) return xff.split(",")[0].trim();
+  return "0.0.0.0";
 }
-
