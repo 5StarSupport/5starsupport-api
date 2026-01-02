@@ -1,4 +1,4 @@
-/* File: netlify/functions/api.mts */
+/* File: netlify/functions/api.ts */
 
 import type { Config, Context } from "@netlify/functions";
 import { getStore } from "@netlify/blobs";
@@ -54,12 +54,11 @@ type JwtPayload = {
 type SlotLock = { ids: string[] };
 
 type EnvConfig = {
-  jwtSecret: string;
-  allowedOrigins: string[] | null;
-  crmUsersJson: string | null;
-  adminUser: string | null;
-  adminPassword: string | null;
-  adminPasswordHash: string | null;
+  jwtSecret: string; // JWT_SECRET
+  allowedOrigins: string[] | null; // ALLOWED_ORIGINS (comma-separated), null = "*"
+  crmUsername: string | null; // CRM_USERNAME
+  crmPasswordHash: string | null; // CRM_PASSWORD_HASH (sha256 hex)
+  crmPassword: string | null; // optional: CRM_PASSWORD (plaintext fallback)
   slotMinutes: number;
   openHour: number;
   closeHour: number;
@@ -72,7 +71,15 @@ const STORE_NAME = "crm";
 const CONSISTENCY: "strong" = "strong";
 
 export default async function handler(req: Request, context: Context) {
-  const env = readEnv();
+  const url = new URL(req.url);
+  const path = normalizeApiPath(url.pathname);
+
+  // Always respond to health even if env vars are missing.
+  if (path === "/api/health" && req.method === "GET") {
+    return respondJson({ ok: true }, 200, buildCorsHeaders(readEnvSafe(), req.headers.get("origin") ?? ""));
+  }
+
+  const env = readEnvSafe();
   const origin = req.headers.get("origin") ?? "";
   const corsHeaders = buildCorsHeaders(env, origin);
 
@@ -81,15 +88,10 @@ export default async function handler(req: Request, context: Context) {
   }
 
   try {
-    const url = new URL(req.url);
-    const path = normalizeApiPath(url.pathname);
     const store = getStore({ name: STORE_NAME, consistency: CONSISTENCY });
-
-    const routeResult = await route({ req, context, env, store, url, path, corsHeaders });
-    return routeResult;
-  } catch (err) {
-    const body = json({ error: "internal_error" });
-    return new Response(body, {
+    return await route({ req, context, env, store, url, path, corsHeaders });
+  } catch {
+    return new Response(json({ error: "internal_error" }), {
       status: 500,
       headers: { "content-type": "application/json; charset=utf-8" },
     });
@@ -111,13 +113,16 @@ async function route(args: {
     return respondJson({ ok: true }, 200, args.corsHeaders);
   }
 
+  // ---- AUTH (updated env var names, no scrypt) ----
   if (path === "/api/auth/login" && req.method === "POST") {
+    if (!env.jwtSecret) return respondJson({ error: "misconfigured_jwt_secret" }, 500, args.corsHeaders);
+
     const body = await safeJson(req);
     const username = asString(body?.username);
     const password = asString(body?.password);
     if (!username || !password) return respondJson({ error: "missing_credentials" }, 400, args.corsHeaders);
 
-    const user = await verifyUser(env, username, password);
+    const user = verifyUser(env, username, password);
     if (!user) return respondJson({ error: "invalid_credentials" }, 401, args.corsHeaders);
 
     const token = signJwt(env.jwtSecret, {
@@ -130,6 +135,7 @@ async function route(args: {
     return respondJson({ token, role: user.role }, 200, args.corsHeaders);
   }
 
+  // ---- Public endpoints ----
   if (path === "/api/public/inquiries" && req.method === "POST") {
     const ip = clientIp(args);
     const limited = await rateLimit(store, ip, env.publicDailyRateLimit);
@@ -159,7 +165,11 @@ async function route(args: {
     };
 
     await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
-    await store.setJSON(`indexes/leads/${lead.createdAt}_${lead.id}`, { id: lead.id, createdAt: lead.createdAt }, { onlyIfNew: true });
+    await store.setJSON(
+      `indexes/leads/${lead.createdAt}_${lead.id}`,
+      { id: lead.id, createdAt: lead.createdAt },
+      { onlyIfNew: true },
+    );
 
     return respondJson({ ok: true, leadId: lead.id }, 200, args.corsHeaders);
   }
@@ -242,7 +252,10 @@ async function route(args: {
     );
   }
 
+  // ---- CRM endpoints (JWT required) ----
   if (path.startsWith("/api/crm/")) {
+    if (!env.jwtSecret) return respondJson({ error: "misconfigured_jwt_secret" }, 500, args.corsHeaders);
+
     const auth = requireAuth(env, req.headers.get("authorization") ?? "");
     if (!auth.ok) return respondJson({ error: "unauthorized" }, 401, args.corsHeaders);
 
@@ -272,18 +285,15 @@ async function route(args: {
         const followUpAt = optionalString(body?.followUpAt);
         const assignedTo = optionalString(body?.assignedTo);
 
-        const updated = await patchLead(store, id, (lead) => {
-          const next: Lead = {
-            ...lead,
-            updatedAt: nowIso(),
-            status: status ?? lead.status,
-            notes: notes ?? lead.notes,
-            followUpAt: followUpAt ?? lead.followUpAt,
-            assignedTo: assignedTo ?? lead.assignedTo,
-            timeline: [...lead.timeline, { at: nowIso(), type: "updated" }],
-          };
-          return next;
-        });
+        const updated = await patchLead(store, id, (lead) => ({
+          ...lead,
+          updatedAt: nowIso(),
+          status: status ?? lead.status,
+          notes: notes ?? lead.notes,
+          followUpAt: followUpAt ?? lead.followUpAt,
+          assignedTo: assignedTo ?? lead.assignedTo,
+          timeline: [...lead.timeline, { at: nowIso(), type: "updated" }],
+        }));
 
         if (!updated) return respondJson({ error: "not_found" }, 404, args.corsHeaders);
         return respondJson({ ok: true }, 200, args.corsHeaders);
@@ -397,7 +407,9 @@ async function route(args: {
       if (auth.payload.role !== "admin") return respondJson({ error: "forbidden" }, 403, args.corsHeaders);
 
       const body = await safeJson(req);
-      const snapshot = body?.snapshot as { leads?: Lead[]; appointments?: Appointment[]; slots?: Record<string, SlotLock> } | undefined;
+      const snapshot = body?.snapshot as
+        | { leads?: Lead[]; appointments?: Appointment[]; slots?: Record<string, SlotLock> }
+        | undefined;
       if (!snapshot) return respondJson({ error: "missing_snapshot" }, 400, args.corsHeaders);
 
       await importSnapshot(store, snapshot);
@@ -431,7 +443,7 @@ async function computeAvailability(
   return out;
 }
 
-function buildSlots(env: EnvConfig, date: string): string[] {
+function buildSlots(env: EnvConfig, _date: string): string[] {
   const slots: string[] = [];
   const startMin = env.openHour * 60;
   const endMin = env.closeHour * 60;
@@ -586,15 +598,7 @@ async function listLeads(
 function matchesQuery(lead: Lead, q: string): boolean {
   const needle = q.trim().toLowerCase();
   if (!needle) return true;
-  const hay = [
-    lead.id,
-    lead.name,
-    lead.email ?? "",
-    lead.phone ?? "",
-    lead.service ?? "",
-    lead.notes ?? "",
-    lead.status,
-  ]
+  const hay = [lead.id, lead.name, lead.email ?? "", lead.phone ?? "", lead.service ?? "", lead.notes ?? "", lead.status]
     .join(" ")
     .toLowerCase();
   return hay.includes(needle);
@@ -726,7 +730,11 @@ async function importSnapshot(
 
   for (const lead of snapshot.leads ?? []) {
     await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
-    await store.setJSON(`indexes/leads/${lead.createdAt}_${lead.id}`, { id: lead.id, createdAt: lead.createdAt }, { onlyIfNew: true });
+    await store.setJSON(
+      `indexes/leads/${lead.createdAt}_${lead.id}`,
+      { id: lead.id, createdAt: lead.createdAt },
+      { onlyIfNew: true },
+    );
   }
 
   for (const appt of snapshot.appointments ?? []) {
@@ -754,29 +762,21 @@ function requireAuth(env: EnvConfig, authHeader: string): { ok: true; payload: J
   return { ok: true, payload };
 }
 
-async function verifyUser(
-  env: EnvConfig,
-  username: string,
-  password: string,
-): Promise<{ role: "admin" | "staff" } | null> {
-  if (env.crmUsersJson) {
-    try {
-      const parsed = JSON.parse(env.crmUsersJson) as Array<{ username: string; passwordHash: string; role?: "admin" | "staff" }>;
-      const u = parsed.find((x) => x.username === username);
-      if (!u) return null;
-      if (!verifyScryptPassword(password, u.passwordHash)) return null;
-      return { role: u.role ?? "staff" };
-    } catch {
-      return null;
-    }
+function verifyUser(env: EnvConfig, username: string, password: string): { role: "admin" | "staff" } | null {
+  // Uses your actual env var names:
+  // CRM_USERNAME + CRM_PASSWORD_HASH (sha256 hex), or CRM_PASSWORD (plaintext fallback)
+  if (!env.crmUsername) return null;
+  if (username !== env.crmUsername) return null;
+
+  if (env.crmPasswordHash) {
+    const incomingHash = sha256Hex(password);
+    if (!timingSafeEqualStr(incomingHash, env.crmPasswordHash)) return null;
+    return { role: "admin" };
   }
 
-  if (env.adminUser && username === env.adminUser) {
-    if (env.adminPasswordHash) {
-      if (!verifyScryptPassword(password, env.adminPasswordHash)) return null;
-      return { role: "admin" };
-    }
-    if (env.adminPassword && password === env.adminPassword) return { role: "admin" };
+  if (env.crmPassword) {
+    if (!timingSafeEqualStr(password, env.crmPassword)) return null;
+    return { role: "admin" };
   }
 
   return null;
@@ -792,8 +792,10 @@ function signJwt(secret: string, payload: JwtPayload): string {
 }
 
 function verifyJwt(secret: string, token: string): JwtPayload | null {
+  if (!secret) return null;
   const parts = token.split(".");
   if (parts.length !== 3) return null;
+
   const [h, p, s] = parts;
   const data = `${h}.${p}`;
   const expected = hmacSha256(secret, data);
@@ -810,31 +812,12 @@ function verifyJwt(secret: string, token: string): JwtPayload | null {
   }
 }
 
-function verifyScryptPassword(password: string, encoded: string): boolean {
-  // Format: scrypt$N$r$p$saltB64$dkB64
-  const parts = encoded.split("$");
-  if (parts.length !== 6 || parts[0] !== "scrypt") return false;
-
-  const N = Number(parts[1]);
-  const r = Number(parts[2]);
-  const p = Number(parts[3]);
-  const salt = Buffer.from(parts[4], "base64");
-  const dk = Buffer.from(parts[5], "base64");
-  if (!Number.isFinite(N) || !Number.isFinite(r) || !Number.isFinite(p)) return false;
-
-  const derived = crypto.scryptSync(password, salt, dk.length, { N, r, p });
-  return crypto.timingSafeEqual(derived, dk);
-}
-
 /* ------------------------------- Utilities ------------------------------- */
 
-function readEnv(): EnvConfig {
-  const jwtSecret = Netlify.env.get("JWT_SECRET") ?? process.env.JWT_SECRET ?? "";
-  if (!jwtSecret) {
-    throw new Error("Missing JWT_SECRET");
-  }
+function readEnvSafe(): EnvConfig {
+  const jwtSecret = envGet("JWT_SECRET") ?? "";
 
-  const allowedOriginsRaw = Netlify.env.get("ALLOWED_ORIGINS") ?? process.env.ALLOWED_ORIGINS ?? "";
+  const allowedOriginsRaw = envGet("ALLOWED_ORIGINS") ?? "";
   const allowedOrigins =
     allowedOriginsRaw.trim().length > 0
       ? allowedOriginsRaw
@@ -843,26 +826,24 @@ function readEnv(): EnvConfig {
           .filter(Boolean)
       : null;
 
-  const crmUsersJson = Netlify.env.get("CRM_USERS_JSON") ?? process.env.CRM_USERS_JSON ?? null;
-  const adminUser = Netlify.env.get("CRM_ADMIN_USER") ?? process.env.CRM_ADMIN_USER ?? null;
-  const adminPassword = Netlify.env.get("CRM_ADMIN_PASSWORD") ?? process.env.CRM_ADMIN_PASSWORD ?? null;
-  const adminPasswordHash = Netlify.env.get("CRM_ADMIN_PASSWORD_HASH") ?? process.env.CRM_ADMIN_PASSWORD_HASH ?? null;
+  const crmUsername = envGet("CRM_USERNAME");
+  const crmPasswordHash = envGet("CRM_PASSWORD_HASH");
+  const crmPassword = envGet("CRM_PASSWORD"); // optional fallback
 
-  const slotMinutes = clampInt(Netlify.env.get("SLOT_MINUTES") ?? process.env.SLOT_MINUTES, 10, 240, 30);
-  const openHour = clampInt(Netlify.env.get("OPEN_HOUR") ?? process.env.OPEN_HOUR, 0, 23, 9);
-  const closeHour = clampInt(Netlify.env.get("CLOSE_HOUR") ?? process.env.CLOSE_HOUR, 1, 24, 17);
-  const capacityPerSlot = clampInt(Netlify.env.get("CAPACITY_PER_SLOT") ?? process.env.CAPACITY_PER_SLOT, 1, 50, 1);
+  const slotMinutes = clampInt(envGet("SLOT_MINUTES"), 10, 240, 30);
+  const openHour = clampInt(envGet("OPEN_HOUR"), 0, 23, 9);
+  const closeHour = clampInt(envGet("CLOSE_HOUR"), 1, 24, 17);
+  const capacityPerSlot = clampInt(envGet("CAPACITY_PER_SLOT"), 1, 50, 1);
 
-  const tz = Netlify.env.get("TZ") ?? process.env.TZ ?? "America/Los_Angeles";
-  const publicDailyRateLimit = clampInt(Netlify.env.get("PUBLIC_DAILY_RATE_LIMIT") ?? process.env.PUBLIC_DAILY_RATE_LIMIT, 1, 10_000, 200);
+  const tz = envGet("TZ") ?? "America/Los_Angeles";
+  const publicDailyRateLimit = clampInt(envGet("PUBLIC_DAILY_RATE_LIMIT"), 1, 10_000, 200);
 
   return {
     jwtSecret,
     allowedOrigins,
-    crmUsersJson,
-    adminUser,
-    adminPassword,
-    adminPasswordHash,
+    crmUsername,
+    crmPasswordHash,
+    crmPassword,
     slotMinutes,
     openHour,
     closeHour,
@@ -872,12 +853,22 @@ function readEnv(): EnvConfig {
   };
 }
 
+function envGet(key: string): string | null {
+  // Prefer process.env, fallback to Netlify.env when present.
+  const v1 = process.env[key];
+  if (typeof v1 === "string" && v1.length) return v1;
+
+  const n = (globalThis as any)?.Netlify?.env?.get?.(key);
+  if (typeof n === "string" && n.length) return n;
+
+  return null;
+}
+
 function buildCorsHeaders(env: EnvConfig, origin: string): Headers {
   const h = new Headers();
-  const allowOrigin =
-    env.allowedOrigins === null ? "*" : env.allowedOrigins.includes(origin) ? origin : "";
+  const allowOrigin = env.allowedOrigins === null ? "*" : env.allowedOrigins.includes(origin) ? origin : "";
 
-  h.set("access-control-allow-origin", allowOrigin);
+  h.set("access-control-allow-origin", allowOrigin || ""); // empty blocks browser when not allowed
   h.set("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS");
   h.set("access-control-allow-headers", "content-type,authorization");
   h.set("access-control-max-age", "86400");
@@ -941,11 +932,7 @@ function nowSec(): number {
 }
 
 function b64url(input: string): string {
-  return Buffer.from(input, "utf8")
-    .toString("base64")
-    .replaceAll("=", "")
-    .replaceAll("+", "-")
-    .replaceAll("/", "_");
+  return Buffer.from(input, "utf8").toString("base64").replaceAll("=", "").replaceAll("+", "-").replaceAll("/", "_");
 }
 
 function b64urlDecode(input: string): string {
@@ -964,6 +951,10 @@ function timingSafeEqualStr(a: string, b: string): boolean {
   const bb = Buffer.from(b);
   if (ba.length !== bb.length) return false;
   return crypto.timingSafeEqual(ba, bb);
+}
+
+function sha256Hex(s: string): string {
+  return crypto.createHash("sha256").update(s, "utf8").digest("hex");
 }
 
 function hashShort(s: string): string {
@@ -986,7 +977,6 @@ function dateAddDays(ymd: string, delta: number): string {
 
 function toIsoFromLocal(dateYmd: string, timeHm: string): string {
   // NOTE: For a production scheduling system, use a real TZ library.
-  // Here we treat input as the site's local time and serialize as ISO using system offset.
   const [hh, mm] = timeHm.split(":").map((x) => Number(x));
   const dt = new Date(dateYmd);
   dt.setHours(hh, mm, 0, 0);
@@ -1011,7 +1001,6 @@ function clampInt(v: string | null | undefined, min: number, max: number, def: n
 }
 
 function clientIp(args: { req: Request; context: Context }): string {
-  // Functions v2 provides context.ip. :contentReference[oaicite:2]{index=2}
   const viaContext = (args.context as any)?.ip;
   if (typeof viaContext === "string" && viaContext.trim()) return viaContext.trim();
 
