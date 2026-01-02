@@ -1,19 +1,5 @@
-# netlify.toml
-
 [build]
-  publish = "."
   functions = "netlify/functions"
 
 [functions]
   node_bundler = "esbuild"
-
-[[redirects]]
-  from = "/api/*"
-  to = "/.netlify/functions/api/:splat"
-  status = 200
-  force = true
-
-[dev]
-  functions = "netlify/functions"
-  port = 8888
-
