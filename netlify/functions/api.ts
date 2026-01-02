@@ -10,7 +10,7 @@ export const config: Config = {
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [k: string]: JsonValue };
 
-type LeadStatus = "new" | "follow_up" | "appointment" | "landed" | "no" | "archived";
+type LeadStatus = "hot" | "new" | "follow_up" | "appointment" | "landed" | "no" | "archived";
 type AppointmentStatus = "booked" | "canceled" | "completed";
 
 type Lead = {
@@ -91,10 +91,7 @@ export default async function handler(req: Request, context: Context) {
     const store = getStore({ name: STORE_NAME, consistency: CONSISTENCY });
     return await route({ req, context, env, store, url, path, corsHeaders });
   } catch {
-    return new Response(json({ error: "internal_error" }), {
-      status: 500,
-      headers: { "content-type": "application/json; charset=utf-8" },
-    });
+    return respondJson({ error: "internal_error" }, 500, corsHeaders);
   }
 }
 
@@ -113,7 +110,7 @@ async function route(args: {
     return respondJson({ ok: true }, 200, args.corsHeaders);
   }
 
-  // ---- AUTH (updated env var names, no scrypt) ----
+  // ---- AUTH ----
   if (path === "/api/auth/login" && req.method === "POST") {
     if (!env.jwtSecret) return respondJson({ error: "misconfigured_jwt_secret" }, 500, args.corsHeaders);
 
@@ -136,13 +133,56 @@ async function route(args: {
   }
 
   // ---- Public endpoints ----
+
+  // NEW: Hot leads endpoint (Schedule a Call)
+  if (path === "/api/public/hot-leads" && req.method === "POST") {
+    const ip = clientIp(args);
+    const limited = await rateLimit(store, ip, env.publicDailyRateLimit);
+    if (!limited.ok) return respondJson({ error: "rate_limited" }, 429, args.corsHeaders);
+
+    const body = await safeJson(req);
+
+    // Honeypot (use "hp" so "website" can be real user data)
+    const honeypot = asString(body?.hp);
+    if (honeypot) return respondJson({ ok: true }, 200, args.corsHeaders);
+
+    const name = requiredString(body?.name);
+    if (!name) return respondJson({ error: "missing_name" }, 400, args.corsHeaders);
+
+    const lead: Lead = {
+      id: crypto.randomUUID(),
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      source: "public",
+      status: "hot",
+      name,
+      phone: optionalString(body?.phone),
+      email: optionalString(body?.email),
+      service: optionalString(body?.service),
+      notes: optionalString(body?.notes),
+      preferredDate: optionalString(body?.preferredDate),
+      preferredTime: optionalString(body?.preferredTime),
+      timeline: [{ at: nowIso(), type: "hot_created" }],
+    };
+
+    await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
+    await store.setJSON(
+      `indexes/leads/${lead.createdAt}_${lead.id}`,
+      { id: lead.id, createdAt: lead.createdAt },
+      { onlyIfNew: true },
+    );
+
+    return respondJson({ ok: true, leadId: lead.id }, 200, args.corsHeaders);
+  }
+
+  // Existing inquiries endpoint (updated honeypot from "website" -> "hp")
   if (path === "/api/public/inquiries" && req.method === "POST") {
     const ip = clientIp(args);
     const limited = await rateLimit(store, ip, env.publicDailyRateLimit);
     if (!limited.ok) return respondJson({ error: "rate_limited" }, 429, args.corsHeaders);
 
     const body = await safeJson(req);
-    const honeypot = asString(body?.website);
+    const honeypot = asString(body?.hp);
     if (honeypot) return respondJson({ ok: true }, 200, args.corsHeaders);
 
     const name = requiredString(body?.name);
@@ -190,6 +230,9 @@ async function route(args: {
     if (!limited.ok) return respondJson({ error: "rate_limited" }, 429, args.corsHeaders);
 
     const body = await safeJson(req);
+    const honeypot = asString(body?.hp);
+    if (honeypot) return respondJson({ ok: true }, 200, args.corsHeaders);
+
     const name = requiredString(body?.name);
     const service = requiredString(body?.service) ?? "default";
     const date = requiredString(body?.date);
@@ -763,8 +806,6 @@ function requireAuth(env: EnvConfig, authHeader: string): { ok: true; payload: J
 }
 
 function verifyUser(env: EnvConfig, username: string, password: string): { role: "admin" | "staff" } | null {
-  // Uses your actual env var names:
-  // CRM_USERNAME + CRM_PASSWORD_HASH (sha256 hex), or CRM_PASSWORD (plaintext fallback)
   if (!env.crmUsername) return null;
   if (username !== env.crmUsername) return null;
 
@@ -828,7 +869,7 @@ function readEnvSafe(): EnvConfig {
 
   const crmUsername = envGet("CRM_USERNAME");
   const crmPasswordHash = envGet("CRM_PASSWORD_HASH");
-  const crmPassword = envGet("CRM_PASSWORD"); // optional fallback
+  const crmPassword = envGet("CRM_PASSWORD");
 
   const slotMinutes = clampInt(envGet("SLOT_MINUTES"), 10, 240, 30);
   const openHour = clampInt(envGet("OPEN_HOUR"), 0, 23, 9);
@@ -854,7 +895,6 @@ function readEnvSafe(): EnvConfig {
 }
 
 function envGet(key: string): string | null {
-  // Prefer process.env, fallback to Netlify.env when present.
   const v1 = process.env[key];
   if (typeof v1 === "string" && v1.length) return v1;
 
@@ -866,18 +906,20 @@ function envGet(key: string): string | null {
 
 function buildCorsHeaders(env: EnvConfig, origin: string): Headers {
   const h = new Headers();
-  const allowOrigin = env.allowedOrigins === null ? "*" : env.allowedOrigins.includes(origin) ? origin : "";
 
-  h.set("access-control-allow-origin", allowOrigin || ""); // empty blocks browser when not allowed
+  const allowOrigin =
+    env.allowedOrigins === null ? "*" : env.allowedOrigins.includes(origin) ? origin : null;
+
+  if (allowOrigin) h.set("access-control-allow-origin", allowOrigin);
   h.set("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS");
   h.set("access-control-allow-headers", "content-type,authorization");
   h.set("access-control-max-age", "86400");
   if (allowOrigin && allowOrigin !== "*") h.set("vary", "origin");
+
   return h;
 }
 
 function normalizeApiPath(pathname: string): string {
-  // Handles both: /api/...  and /.netlify/functions/api/... (dev)
   if (pathname.startsWith("/.netlify/functions/api")) {
     const rest = pathname.slice("/.netlify/functions/api".length);
     return `/api${rest || ""}`.replaceAll("//", "/");
@@ -976,7 +1018,6 @@ function dateAddDays(ymd: string, delta: number): string {
 }
 
 function toIsoFromLocal(dateYmd: string, timeHm: string): string {
-  // NOTE: For a production scheduling system, use a real TZ library.
   const [hh, mm] = timeHm.split(":").map((x) => Number(x));
   const dt = new Date(dateYmd);
   dt.setHours(hh, mm, 0, 0);
