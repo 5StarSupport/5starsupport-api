@@ -27,7 +27,8 @@ type Lead = {
   preferredDate?: string;
   preferredTime?: string;
   followUpAt?: string;
-  assignedTo?: string;
+  assignedTo?: string; // "pulled/assigned" owner
+  pulledAt?: string; // when it was pulled/assigned
   timeline: Array<{ at: string; type: string; note?: string }>;
 };
 
@@ -65,6 +66,23 @@ type EnvConfig = {
   capacityPerSlot: number;
   tz: string;
   publicDailyRateLimit: number;
+};
+
+type SyncSnapshot = {
+  workspaceId: string;
+  version: number;
+  updatedAt: string;
+
+  // common sections
+  leads: any[];
+  todos: any[];
+  appointments: any[];
+
+  // arbitrary extra sections
+  sections: Record<string, any[]>;
+
+  // deletion safety
+  tombstones: Record<string, Record<string, string>>;
 };
 
 const STORE_NAME = "crm";
@@ -110,6 +128,80 @@ async function route(args: {
     return respondJson({ ok: true }, 200, args.corsHeaders);
   }
 
+  // =========================
+  // SYNC (JWT required)
+  // =========================
+  if (path === "/api/sync" && (req.method === "GET" || req.method === "POST")) {
+    if (!env.jwtSecret) return respondJson({ error: "misconfigured_jwt_secret" }, 500, args.corsHeaders);
+
+    const auth = requireAuth(env, req.headers.get("authorization") ?? "");
+    if (!auth.ok) return respondJson({ error: "unauthorized" }, 401, args.corsHeaders);
+
+    if (req.method === "GET") {
+      const workspaceId = normalizeWorkspaceId(url.searchParams.get("workspaceId"));
+      const snap = await getOrInitWorkspaceSnapshot(store, workspaceId);
+      return respondJson(
+        {
+          workspaceId,
+          version: snap.version,
+          updatedAt: snap.updatedAt,
+          leads: snap.leads,
+          todos: snap.todos,
+          appointments: snap.appointments,
+          sections: snap.sections,
+          tombstones: snap.tombstones,
+        },
+        200,
+        args.corsHeaders,
+      );
+    }
+
+    // POST /api/sync
+    const body = await safeJson(req);
+    const workspaceId = normalizeWorkspaceId(asString(body?.workspaceId) ?? url.searchParams.get("workspaceId"));
+    const incoming = (body?.snapshot ?? body?.changes ?? body) as any;
+
+    const merged = await syncUpWorkspace(store, workspaceId, incoming);
+    return respondJson(
+      {
+        workspaceId,
+        version: merged.version,
+        updatedAt: merged.updatedAt,
+        leads: merged.leads,
+        todos: merged.todos,
+        appointments: merged.appointments,
+        sections: merged.sections,
+        tombstones: merged.tombstones,
+      },
+      200,
+      args.corsHeaders,
+    );
+  }
+
+  // =========================
+  // Server-enforced "Pull Leads once" (JWT required)
+  // POST /api/leads/pull
+  // =========================
+  if (path === "/api/leads/pull" && req.method === "POST") {
+    if (!env.jwtSecret) return respondJson({ error: "misconfigured_jwt_secret" }, 500, args.corsHeaders);
+
+    const auth = requireAuth(env, req.headers.get("authorization") ?? "");
+    if (!auth.ok) return respondJson({ error: "unauthorized" }, 401, args.corsHeaders);
+
+    const body = await safeJson(req);
+    const limit = clampInt(asString(body?.limit) ?? url.searchParams.get("limit"), 1, 200, 50);
+    const statusParam = asString(body?.status) ?? url.searchParams.get("status") ?? "hot";
+    const status = statusParam as LeadStatus;
+
+    const pulled = await pullUnassignedLeadsOnce(store, {
+      limit,
+      status,
+      assignee: auth.payload.sub,
+    });
+
+    return respondJson({ ok: true, pulled: pulled.length, leads: pulled }, 200, args.corsHeaders);
+  }
+
   // ---- AUTH ----
   if (path === "/api/auth/login" && req.method === "POST") {
     if (!env.jwtSecret) return respondJson({ error: "misconfigured_jwt_secret" }, 500, args.corsHeaders);
@@ -149,6 +241,14 @@ async function route(args: {
     const name = requiredString(body?.name);
     if (!name) return respondJson({ error: "missing_name" }, 400, args.corsHeaders);
 
+    // Server-side dedupe (email/phone)
+    const email = optionalString(body?.email);
+    const phone = optionalString(body?.phone);
+    const existingId = await findLeadByDedupe(store, { email, phone });
+    if (existingId) {
+      return respondJson({ ok: true, leadId: existingId, deduped: true }, 200, args.corsHeaders);
+    }
+
     const lead: Lead = {
       id: crypto.randomUUID(),
       createdAt: nowIso(),
@@ -156,8 +256,8 @@ async function route(args: {
       source: "public",
       status: "hot",
       name,
-      phone: optionalString(body?.phone),
-      email: optionalString(body?.email),
+      phone,
+      email,
       service: optionalString(body?.service),
       notes: optionalString(body?.notes),
       preferredDate: optionalString(body?.preferredDate),
@@ -165,12 +265,12 @@ async function route(args: {
       timeline: [{ at: nowIso(), type: "hot_created" }],
     };
 
-    await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
-    await store.setJSON(
-      `indexes/leads/${lead.createdAt}_${lead.id}`,
-      { id: lead.id, createdAt: lead.createdAt },
-      { onlyIfNew: true },
-    );
+    // Create + establish dedupe keys (safe against retries)
+    const created = await createLeadWithDedupe(store, lead);
+    if (!created.ok) {
+      // If dedupe raced, return the canonical id
+      return respondJson({ ok: true, leadId: created.leadId, deduped: true }, 200, args.corsHeaders);
+    }
 
     return respondJson({ ok: true, leadId: lead.id }, 200, args.corsHeaders);
   }
@@ -188,6 +288,14 @@ async function route(args: {
     const name = requiredString(body?.name);
     if (!name) return respondJson({ error: "missing_name" }, 400, args.corsHeaders);
 
+    // Server-side dedupe (email/phone)
+    const email = optionalString(body?.email);
+    const phone = optionalString(body?.phone);
+    const existingId = await findLeadByDedupe(store, { email, phone });
+    if (existingId) {
+      return respondJson({ ok: true, leadId: existingId, deduped: true }, 200, args.corsHeaders);
+    }
+
     const lead: Lead = {
       id: crypto.randomUUID(),
       createdAt: nowIso(),
@@ -195,8 +303,8 @@ async function route(args: {
       source: "public",
       status: "new",
       name,
-      phone: optionalString(body?.phone),
-      email: optionalString(body?.email),
+      phone,
+      email,
       service: optionalString(body?.service),
       notes: optionalString(body?.notes),
       preferredDate: optionalString(body?.preferredDate),
@@ -204,12 +312,10 @@ async function route(args: {
       timeline: [{ at: nowIso(), type: "created" }],
     };
 
-    await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
-    await store.setJSON(
-      `indexes/leads/${lead.createdAt}_${lead.id}`,
-      { id: lead.id, createdAt: lead.createdAt },
-      { onlyIfNew: true },
-    );
+    const created = await createLeadWithDedupe(store, lead);
+    if (!created.ok) {
+      return respondJson({ ok: true, leadId: created.leadId, deduped: true }, 200, args.corsHeaders);
+    }
 
     return respondJson({ ok: true, leadId: lead.id }, 200, args.corsHeaders);
   }
@@ -465,6 +571,255 @@ async function route(args: {
   return respondJson({ error: "not_found" }, 404, args.corsHeaders);
 }
 
+/* ============================= SYNC HELPERS ============================= */
+
+function normalizeWorkspaceId(v: string | null | undefined): string {
+  const raw = (v ?? "").trim();
+  if (!raw) return "default";
+  // allow simple workspace tokens; collapse others to safe
+  const safe = raw.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return safe.length ? safe.slice(0, 64) : "default";
+}
+
+function workspaceSnapshotKey(workspaceId: string): string {
+  return `workspaces/${workspaceId}/snapshot`;
+}
+
+function emptySnapshot(workspaceId: string): SyncSnapshot {
+  return {
+    workspaceId,
+    version: 1,
+    updatedAt: nowIso(),
+    leads: [],
+    todos: [],
+    appointments: [],
+    sections: {},
+    tombstones: {},
+  };
+}
+
+function parseUpdatedAt(v: any): number {
+  const s = typeof v === "string" ? v : "";
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : 0;
+}
+
+function isObj(v: any): v is Record<string, any> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+function getId(v: any): string {
+  return typeof v?.id === "string" ? v.id : "";
+}
+
+function ensureArray(v: any): any[] {
+  return Array.isArray(v) ? v : [];
+}
+
+function ensureRecordArray(v: any): Record<string, any[]> {
+  if (!isObj(v)) return {};
+  const out: Record<string, any[]> = {};
+  for (const [k, val] of Object.entries(v)) {
+    if (!k) continue;
+    out[k] = ensureArray(val);
+  }
+  return out;
+}
+
+function ensureTombstones(v: any): Record<string, Record<string, string>> {
+  if (!isObj(v)) return {};
+  const out: Record<string, Record<string, string>> = {};
+  for (const [section, m] of Object.entries(v)) {
+    if (!isObj(m)) continue;
+    const sec: Record<string, string> = {};
+    for (const [id, ts] of Object.entries(m)) {
+      if (typeof id !== "string") continue;
+      if (typeof ts !== "string") continue;
+      sec[id] = ts;
+    }
+    out[section] = sec;
+  }
+  return out;
+}
+
+async function getOrInitWorkspaceSnapshot(store: ReturnType<typeof getStore>, workspaceId: string): Promise<SyncSnapshot> {
+  const key = workspaceSnapshotKey(workspaceId);
+  const existing = (await store.get(key, { type: "json" })) as SyncSnapshot | null;
+  if (existing && typeof existing?.version === "number") return normalizeSnapshotShape(existing, workspaceId);
+
+  const snap = emptySnapshot(workspaceId);
+  await store.setJSON(key, snap, { onlyIfNew: true });
+  const reread = (await store.get(key, { type: "json" })) as SyncSnapshot | null;
+  return reread ? normalizeSnapshotShape(reread, workspaceId) : snap;
+}
+
+function normalizeSnapshotShape(s: any, workspaceId: string): SyncSnapshot {
+  const version = typeof s?.version === "number" && s.version > 0 ? Math.floor(s.version) : 1;
+  const updatedAt = typeof s?.updatedAt === "string" && s.updatedAt ? s.updatedAt : nowIso();
+
+  return {
+    workspaceId,
+    version,
+    updatedAt,
+    leads: ensureArray(s?.leads),
+    todos: ensureArray(s?.todos),
+    appointments: ensureArray(s?.appointments),
+    sections: ensureRecordArray(s?.sections),
+    tombstones: ensureTombstones(s?.tombstones),
+  };
+}
+
+function mergeSection(
+  sectionName: string,
+  serverItems: any[],
+  incomingItems: any[],
+  tombstones: Record<string, Record<string, string>>,
+): { items: any[]; tombstones: Record<string, Record<string, string>> } {
+  const nextTomb = { ...tombstones, [sectionName]: { ...(tombstones[sectionName] ?? {}) } };
+
+  const map = new Map<string, any>();
+  for (const it of serverItems) {
+    const id = getId(it);
+    if (!id) continue;
+    map.set(id, it);
+  }
+
+  // Respect existing tombstones against server data too (in case older snapshots existed)
+  const secTombs = nextTomb[sectionName] ?? {};
+  for (const [id, ts] of Object.entries(secTombs)) {
+    const existing = map.get(id);
+    if (!existing) continue;
+    const existingTs = parseUpdatedAt(existing?.updatedAt);
+    const tombTs = parseUpdatedAt(ts);
+    if (tombTs >= existingTs) map.delete(id);
+  }
+
+  for (const it of incomingItems) {
+    const id = getId(it);
+    if (!id) continue;
+
+    const inTs = parseUpdatedAt(it?.updatedAt);
+    const tombTs = parseUpdatedAt(secTombs[id]);
+
+    // If a tombstone is newer, ignore non-delete updates
+    const isDelete = !!it?._deleted;
+    if (!isDelete && tombTs && tombTs >= inTs) continue;
+
+    if (isDelete) {
+      const cur = map.get(id);
+      const curTs = parseUpdatedAt(cur?.updatedAt);
+      const bestTs = Math.max(inTs, curTs, tombTs);
+      secTombs[id] = new Date(bestTs || Date.now()).toISOString();
+      map.delete(id);
+      continue;
+    }
+
+    const cur = map.get(id);
+    if (!cur) {
+      map.set(id, it);
+      continue;
+    }
+
+    const curTs = parseUpdatedAt(cur?.updatedAt);
+    if (inTs >= curTs) map.set(id, it);
+  }
+
+  nextTomb[sectionName] = secTombs;
+  return { items: Array.from(map.values()), tombstones: nextTomb };
+}
+
+function mergeSnapshots(server: SyncSnapshot, incomingRaw: any): SyncSnapshot {
+  const incoming = normalizeSnapshotShape(
+    {
+      ...incomingRaw,
+      // allow clients to send "sections" or extra top-level arrays
+      sections: isObj(incomingRaw?.sections) ? incomingRaw.sections : {},
+      tombstones: incomingRaw?.tombstones,
+    },
+    server.workspaceId,
+  );
+
+  // If client sent extra top-level arrays (besides known keys), treat them as sections too
+  if (isObj(incomingRaw)) {
+    const known = new Set(["workspaceId", "version", "updatedAt", "leads", "todos", "appointments", "sections", "tombstones", "snapshot", "changes"]);
+    for (const [k, v] of Object.entries(incomingRaw)) {
+      if (known.has(k)) continue;
+      if (Array.isArray(v)) incoming.sections[k] = v;
+    }
+  }
+
+  let tombstones = { ...server.tombstones };
+
+  const mergedLeads = mergeSection("leads", server.leads, incoming.leads, tombstones);
+  tombstones = mergedLeads.tombstones;
+
+  const mergedTodos = mergeSection("todos", server.todos, incoming.todos, tombstones);
+  tombstones = mergedTodos.tombstones;
+
+  const mergedAppointments = mergeSection("appointments", server.appointments, incoming.appointments, tombstones);
+  tombstones = mergedAppointments.tombstones;
+
+  const serverSections = server.sections ?? {};
+  const incomingSections = incoming.sections ?? {};
+  const mergedSections: Record<string, any[]> = { ...serverSections };
+
+  // union of section keys
+  const keys = new Set<string>([...Object.keys(serverSections), ...Object.keys(incomingSections)]);
+  for (const k of keys) {
+    // prevent weird keys from becoming blob bloat
+    const safeName = String(k).trim();
+    if (!safeName) continue;
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(safeName)) continue;
+
+    const serverArr = ensureArray(serverSections[safeName]);
+    const incomingArr = ensureArray(incomingSections[safeName]);
+
+    const merged = mergeSection(`sections:${safeName}`, serverArr, incomingArr, tombstones);
+    tombstones = merged.tombstones;
+    mergedSections[safeName] = merged.items;
+  }
+
+  return {
+    workspaceId: server.workspaceId,
+    version: Math.max(1, server.version) + 1,
+    updatedAt: nowIso(),
+    leads: mergedLeads.items,
+    todos: mergedTodos.items,
+    appointments: mergedAppointments.items,
+    sections: mergedSections,
+    tombstones,
+  };
+}
+
+async function syncUpWorkspace(store: ReturnType<typeof getStore>, workspaceId: string, incoming: any): Promise<SyncSnapshot> {
+  const key = workspaceSnapshotKey(workspaceId);
+
+  for (let i = 0; i < 8; i += 1) {
+    const existing = (await store.getWithMetadata(key, { type: "json" })) as
+      | { data: SyncSnapshot; etag: string }
+      | null;
+
+    if (!existing) {
+      const base = emptySnapshot(workspaceId);
+      const merged = mergeSnapshots(base, incoming);
+
+      const res = await store.setJSON(key, merged, { onlyIfNew: true });
+      if (res.modified) return merged;
+      continue;
+    }
+
+    const serverSnap = normalizeSnapshotShape(existing.data, workspaceId);
+    const merged = mergeSnapshots(serverSnap, incoming);
+
+    const res = await store.setJSON(key, merged, { onlyIfMatch: existing.etag });
+    if (res.modified) return merged;
+  }
+
+  // fallback: last read
+  const final = (await store.get(key, { type: "json" })) as SyncSnapshot | null;
+  return final ? normalizeSnapshotShape(final, workspaceId) : emptySnapshot(workspaceId);
+}
+
 /* ----------------------------- Availability ----------------------------- */
 
 async function computeAvailability(
@@ -649,6 +1004,134 @@ function matchesQuery(lead: Lead, q: string): boolean {
   return hay.includes(needle);
 }
 
+/* ------------------ Pull Leads once + server-side dedupe ------------------ */
+
+function normalizeEmail(email?: string): string {
+  return (email ?? "").trim().toLowerCase();
+}
+
+function normalizePhone(phone?: string): string {
+  // keep digits and + (very light normalization)
+  const p = (phone ?? "").trim();
+  if (!p) return "";
+  const cleaned = p.replace(/[^\d+]/g, "");
+  return cleaned;
+}
+
+function leadDedupeKeys(email?: string, phone?: string): string[] {
+  const e = normalizeEmail(email);
+  const p = normalizePhone(phone);
+  const keys: string[] = [];
+
+  if (e && p) keys.push(`dedupe/leads/emailphone/${hashShort(`${e}|${p}`)}`);
+  if (e) keys.push(`dedupe/leads/email/${hashShort(e)}`);
+  if (p) keys.push(`dedupe/leads/phone/${hashShort(p)}`);
+
+  return keys;
+}
+
+async function findLeadByDedupe(
+  store: ReturnType<typeof getStore>,
+  args: { email?: string; phone?: string },
+): Promise<string | null> {
+  const keys = leadDedupeKeys(args.email, args.phone);
+  for (const k of keys) {
+    const hit = (await store.get(k, { type: "json" })) as { id?: string } | null;
+    const id = typeof hit?.id === "string" ? hit.id : "";
+    if (id) return id;
+  }
+  return null;
+}
+
+async function createLeadWithDedupe(
+  store: ReturnType<typeof getStore>,
+  lead: Lead,
+): Promise<{ ok: true } | { ok: false; leadId: string }> {
+  // Primary uniqueness is lead.id (handled by onlyIfNew on leads/<id>), but we also enforce fallback by email/phone.
+  const keys = leadDedupeKeys(lead.email, lead.phone);
+
+  // If we have dedupe keys, attempt to claim them first.
+  for (const k of keys) {
+    const res = await store.setJSON(k, { id: lead.id }, { onlyIfNew: true });
+    if (!res.modified) {
+      const existing = (await store.get(k, { type: "json" })) as { id?: string } | null;
+      const existingId = typeof existing?.id === "string" ? existing.id : "";
+      if (existingId) return { ok: false, leadId: existingId };
+      return { ok: false, leadId: lead.id };
+    }
+  }
+
+  // Now create the lead itself (if this races, caller can retry safely)
+  const created = await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
+  if (!created.modified) {
+    // lead.id already exists (retry). Use it.
+    return { ok: false, leadId: lead.id };
+  }
+
+  await store.setJSON(
+    `indexes/leads/${lead.createdAt}_${lead.id}`,
+    { id: lead.id, createdAt: lead.createdAt },
+    { onlyIfNew: true },
+  );
+
+  return { ok: true };
+}
+
+async function tryAssignLead(
+  store: ReturnType<typeof getStore>,
+  leadId: string,
+  assignee: string,
+): Promise<Lead | null> {
+  for (let i = 0; i < 6; i += 1) {
+    const existing = (await store.getWithMetadata(`leads/${leadId}`, { type: "json" })) as
+      | { data: Lead; etag: string }
+      | null;
+
+    if (!existing?.data) return null;
+
+    const lead = existing.data;
+    if (lead.assignedTo) return null;
+
+    const ts = nowIso();
+    const next: Lead = {
+      ...lead,
+      assignedTo: assignee,
+      pulledAt: ts,
+      updatedAt: ts,
+      timeline: [...(lead.timeline ?? []), { at: ts, type: "pulled", note: assignee }],
+    };
+
+    const res = await store.setJSON(`leads/${leadId}`, next, { onlyIfMatch: existing.etag });
+    if (res.modified) return next;
+  }
+
+  return null;
+}
+
+async function pullUnassignedLeadsOnce(
+  store: ReturnType<typeof getStore>,
+  opts: { limit: number; status?: LeadStatus; assignee: string },
+): Promise<Lead[]> {
+  // We intentionally scan more than requested and assign with per-lead optimistic locking.
+  const scanLimit = Math.min(500, Math.max(opts.limit * 8, opts.limit));
+  const candidates = await listLeads(store, { limit: scanLimit, q: undefined, status: undefined });
+
+  const out: Lead[] = [];
+
+  for (const l of candidates) {
+    if (out.length >= opts.limit) break;
+
+    if (opts.status && l.status !== opts.status) continue;
+    if (l.status === "archived") continue;
+    if (l.assignedTo) continue;
+
+    const assigned = await tryAssignLead(store, l.id, opts.assignee);
+    if (assigned) out.push(assigned);
+  }
+
+  return out;
+}
+
 /* ------------------------------ Appointments ----------------------------- */
 
 async function patchAppointment(
@@ -772,6 +1255,7 @@ async function importSnapshot(
   await deleteByPrefix(store, "appointments/");
   await deleteByPrefix(store, "slots/");
   await deleteByPrefix(store, "indexes/leads/");
+  await deleteByPrefix(store, "dedupe/leads/");
 
   for (const lead of snapshot.leads ?? []) {
     await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
@@ -780,6 +1264,10 @@ async function importSnapshot(
       { id: lead.id, createdAt: lead.createdAt },
       { onlyIfNew: true },
     );
+
+    // re-establish dedupe keys if possible
+    const keys = leadDedupeKeys(lead.email, lead.phone);
+    for (const k of keys) await store.setJSON(k, { id: lead.id }, { onlyIfNew: true });
   }
 
   for (const appt of snapshot.appointments ?? []) {
@@ -909,8 +1397,7 @@ function envGet(key: string): string | null {
 function buildCorsHeaders(env: EnvConfig, origin: string): Headers {
   const h = new Headers();
 
-  const allowOrigin =
-    env.allowedOrigins === null ? "*" : env.allowedOrigins.includes(origin) ? origin : null;
+  const allowOrigin = env.allowedOrigins === null ? "*" : env.allowedOrigins.includes(origin) ? origin : null;
 
   if (allowOrigin) h.set("access-control-allow-origin", allowOrigin);
   h.set("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS");
