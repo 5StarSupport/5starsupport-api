@@ -57,6 +57,25 @@ type Todo = {
   dueAt?: string;
 };
 
+/**
+ * Device snapshot sync (CRM merges on client).
+ * - customers: full device state
+ * - tombstones: deletions by id (deletedAt ISO) so deletes sync across devices
+ */
+type Customer = {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  [k: string]: any;
+};
+
+type DeviceSnapshot = {
+  deviceId: string;
+  at: string;
+  customers: Customer[];
+  tombstones: Record<string, string>;
+};
+
 type JwtPayload = {
   sub: string;
   role: "admin" | "staff";
@@ -357,6 +376,72 @@ async function route(args: {
     );
   }
 
+  // ---- Device Snapshot Sync (JWT required) ----
+  if (path === "/api/snapshots" && req.method === "GET") {
+    if (!env.jwtSecret) return respondJson({ error: "misconfigured_jwt_secret" }, 500, args.corsHeaders);
+
+    const auth = requireAuth(env, req.headers.get("authorization") ?? "");
+    if (!auth.ok) return respondJson({ error: "unauthorized" }, 401, args.corsHeaders);
+
+    const { blobs } = await store.list({ prefix: "snapshots/" });
+    const keys = blobs.map((b) => b.key).sort().slice(0, 500);
+
+    const snapshots: DeviceSnapshot[] = [];
+    for (const k of keys) {
+      const raw = (await store.get(k, { type: "json" })) as any | null;
+      if (!raw) continue;
+
+      const deviceIdFromKey = k.split("/").pop() ?? "";
+      const snap = asDeviceSnapshot(raw, deviceIdFromKey);
+      if (snap) snapshots.push(snap);
+    }
+
+    return respondJson({ ok: true, snapshots } as any, 200, args.corsHeaders);
+  }
+
+  if (path.startsWith("/api/snapshots/")) {
+    if (!env.jwtSecret) return respondJson({ error: "misconfigured_jwt_secret" }, 500, args.corsHeaders);
+
+    const auth = requireAuth(env, req.headers.get("authorization") ?? "");
+    if (!auth.ok) return respondJson({ error: "unauthorized" }, 401, args.corsHeaders);
+
+    const deviceId = decodeURIComponent(path.slice("/api/snapshots/".length));
+    if (!deviceId || !isSafeDeviceId(deviceId)) {
+      return respondJson({ error: "invalid_deviceId" }, 400, args.corsHeaders);
+    }
+
+    const key = snapshotKey(deviceId);
+
+    if (req.method === "GET") {
+      const raw = (await store.get(key, { type: "json" })) as any | null;
+      if (!raw) return respondJson({ error: "not_found" }, 404, args.corsHeaders);
+
+      const snap = asDeviceSnapshot(raw, deviceId);
+      if (!snap) return respondJson({ error: "corrupt_snapshot" }, 500, args.corsHeaders);
+
+      return respondJson({ ok: true, snapshot: snap } as any, 200, args.corsHeaders);
+    }
+
+    if (req.method === "PUT" || req.method === "POST") {
+      const body = await safeJson(req);
+      if (!body) return respondJson({ error: "missing_json" }, 400, args.corsHeaders);
+
+      const snap = asDeviceSnapshot(body, deviceId);
+      if (!snap) return respondJson({ error: "invalid_snapshot" }, 400, args.corsHeaders);
+
+      const toStore: DeviceSnapshot = {
+        ...snap,
+        deviceId,
+        at: nowIso(),
+      };
+
+      await store.setJSON(key, toStore as any);
+      return respondJson({ ok: true }, 200, args.corsHeaders);
+    }
+
+    return respondJson({ error: "not_found" }, 404, args.corsHeaders);
+  }
+
   // ---- Sync endpoints (JWT required) ----
 
   // Sync Down (new device bootstrapping)
@@ -378,7 +463,7 @@ async function route(args: {
         workspaceId,
         meta,
         snapshot,
-      },
+      } as any,
       200,
       args.corsHeaders,
     );
@@ -423,7 +508,7 @@ async function route(args: {
         workspaceId,
         meta,
         snapshot: latest,
-      },
+      } as any,
       200,
       args.corsHeaders,
     );
@@ -447,7 +532,7 @@ async function route(args: {
       assignedTo: auth.payload.sub,
     });
 
-    return respondJson({ ok: true, pulled: pulled.length, leads: pulled }, 200, args.corsHeaders);
+    return respondJson({ ok: true, pulled: pulled.length, leads: pulled } as any, 200, args.corsHeaders);
   }
 
   // ---- CRM endpoints (JWT required) ----
@@ -463,7 +548,7 @@ async function route(args: {
       const limit = clampInt(url.searchParams.get("limit"), 1, 200, 50);
 
       const leads = await listLeads(store, { status: status ?? undefined, q: q ?? undefined, limit });
-      return respondJson({ leads }, 200, args.corsHeaders);
+      return respondJson({ leads } as any, 200, args.corsHeaders);
     }
 
     if (path.startsWith("/api/crm/leads/")) {
@@ -473,7 +558,7 @@ async function route(args: {
       if (req.method === "GET") {
         const lead = (await store.get(`leads/${id}`, { type: "json" })) as Lead | null;
         if (!lead) return respondJson({ error: "not_found" }, 404, args.corsHeaders);
-        return respondJson({ lead }, 200, args.corsHeaders);
+        return respondJson({ lead } as any, 200, args.corsHeaders);
       }
 
       if (req.method === "PUT") {
@@ -504,7 +589,7 @@ async function route(args: {
       const limit = clampInt(url.searchParams.get("limit"), 1, 500, 200);
 
       const appts = await listAppointments(store, { from: from ?? undefined, to: to ?? undefined, limit });
-      return respondJson({ appointments: appts }, 200, args.corsHeaders);
+      return respondJson({ appointments: appts } as any, 200, args.corsHeaders);
     }
 
     if (path === "/api/crm/appointments" && req.method === "POST") {
@@ -545,7 +630,7 @@ async function route(args: {
         return respondJson({ error: "create_failed" }, 500, args.corsHeaders);
       }
 
-      return respondJson({ ok: true, appointmentId: appt.id }, 200, args.corsHeaders);
+      return respondJson({ ok: true, appointmentId: appt.id } as any, 200, args.corsHeaders);
     }
 
     if (path.startsWith("/api/crm/appointments/")) {
@@ -555,7 +640,7 @@ async function route(args: {
       if (req.method === "GET") {
         const appt = (await store.get(`appointments/${id}`, { type: "json" })) as Appointment | null;
         if (!appt) return respondJson({ error: "not_found" }, 404, args.corsHeaders);
-        return respondJson({ appointment: appt }, 200, args.corsHeaders);
+        return respondJson({ appointment: appt } as any, 200, args.corsHeaders);
       }
 
       if (req.method === "PUT") {
@@ -592,13 +677,13 @@ async function route(args: {
 
     if (path === "/api/crm/metrics" && req.method === "GET") {
       const metrics = await computeMetrics(store);
-      return respondJson({ metrics }, 200, args.corsHeaders);
+      return respondJson({ metrics } as any, 200, args.corsHeaders);
     }
 
     if (path === "/api/crm/export" && req.method === "POST") {
       if (auth.payload.role !== "admin") return respondJson({ error: "forbidden" }, 403, args.corsHeaders);
       const snapshot = await exportSnapshot(store);
-      return respondJson({ snapshot }, 200, args.corsHeaders);
+      return respondJson({ snapshot } as any, 200, args.corsHeaders);
     }
 
     if (path === "/api/crm/import" && req.method === "POST") {
@@ -1208,7 +1293,6 @@ async function bumpSyncMeta(store: ReturnType<typeof getStore>, workspaceId: str
     if (res.modified) return next;
   }
 
-  // fallback read
   return await getSyncMeta(store, workspaceId);
 }
 
@@ -1252,7 +1336,6 @@ async function mergeSnapshots(
   for (const inc of args.incoming.leads ?? []) {
     if (!inc?.id || !inc?.createdAt) continue;
 
-    // primary by id
     const ex = serverLeads.get(inc.id);
     if (ex) {
       const newer = isoGt(inc.updatedAt, ex.updatedAt);
@@ -1263,7 +1346,6 @@ async function mergeSnapshots(
       continue;
     }
 
-    // fallback by contact
     const byContact = await findExistingLeadIdByContact(store, { email: inc.email, phone: inc.phone });
     if (byContact) {
       const ex2 = serverLeads.get(byContact) || ((await store.get(`leads/${byContact}`, { type: "json" })) as Lead | null);
@@ -1277,10 +1359,8 @@ async function mergeSnapshots(
       }
     }
 
-    // brand-new lead; also enforce contact indexes (if conflict, drop it)
     const reserve = await reserveContactIndexes(store, { id: inc.id, email: inc.email, phone: inc.phone });
     if (!reserve.ok) {
-      // conflict => merge into existing lead if possible
       const ex3 =
         serverLeads.get(reserve.existingId) ||
         ((await store.get(`leads/${reserve.existingId}`, { type: "json" })) as Lead | null);
@@ -1296,7 +1376,7 @@ async function mergeSnapshots(
 
     const nextNew: Lead = {
       ...inc,
-      source: inc.source === "public" ? "public" : "public",
+      source: "public",
       timeline: mergeTimeline([], inc.timeline),
     };
     serverLeads.set(nextNew.id, nextNew);
@@ -1634,4 +1714,41 @@ function clientIp(args: { req: Request; context: Context }): string {
   const xff = h.get("x-forwarded-for");
   if (xff) return xff.split(",")[0].trim();
   return "0.0.0.0";
+}
+
+/* ---------------------- Device Snapshot Sync Helpers --------------------- */
+
+function isSafeDeviceId(s: string): boolean {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(s);
+}
+
+function snapshotKey(deviceId: string): string {
+  return `snapshots/${deviceId}`;
+}
+
+function asDeviceSnapshot(v: any, fallbackDeviceId: string): DeviceSnapshot | null {
+  if (!v || typeof v !== "object") return null;
+
+  const deviceId = safeText(v.deviceId) || fallbackDeviceId;
+  const at = safeText(v.at) || nowIso();
+
+  const customersRaw = Array.isArray(v.customers) ? v.customers : [];
+  const customers: Customer[] = customersRaw
+    .filter((c: any) => c && typeof c === "object" && typeof c.id === "string")
+    .map((c: any) => ({
+      ...c,
+      id: String(c.id),
+      createdAt: safeText(c.createdAt) || nowIso(),
+      updatedAt: safeText(c.updatedAt) || safeText(c.createdAt) || nowIso(),
+    }));
+
+  const tombstonesRaw = v.tombstones && typeof v.tombstones === "object" ? v.tombstones : {};
+  const tombstones: Record<string, string> = {};
+  for (const [k, val] of Object.entries(tombstonesRaw)) {
+    const id = safeText(k);
+    const deletedAt = safeText(val);
+    if (id && deletedAt) tombstones[id] = deletedAt;
+  }
+
+  return { deviceId, at, customers, tombstones };
 }
