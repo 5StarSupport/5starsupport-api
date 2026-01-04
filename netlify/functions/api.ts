@@ -1107,17 +1107,34 @@ async function tryClaimLead(
   return null;
 }
 
-async function consumeLead(store: ReturnType<typeof getStore>, lead: Lead): Promise<void> {
+async function consumeLead(
+  store: ReturnType<typeof getStore>,
+  lead: Lead
+): Promise<void> {
   const ts = nowIso();
+  const wid = lead.workspaceId; // however you store it
 
+  // ✅ workspace-scoped marker
+  const markerKey = `pulled/${wid}/${lead.id}`;
+
+  // ✅ only continue if we truly marked it as new
+  let wrote = false;
   try {
-    await store.setJSON(`pulled/${lead.id}`, lead, { onlyIfNew: true });
-  } catch {}
+    // if your store returns something, use it. If not, wrap with a read check.
+    await store.setJSON(markerKey, { id: lead.id, pulledAt: ts }, { onlyIfNew: true });
+    wrote = true;
+  } catch {
+    wrote = false;
+  }
 
+  if (!wrote) return; // ✅ already pulled
+
+  // ✅ archive without "deleted"
   await patchLead(store, lead.id, (l) => ({
     ...l,
     status: "archived",
-    deletedAt: ts,
+    archivedAt: ts,
+    pulledAt: ts,
     updatedAt: ts,
     updatedBy: lead.updatedBy ?? l.updatedBy,
     updatedDeviceId: lead.updatedDeviceId ?? l.updatedDeviceId,
