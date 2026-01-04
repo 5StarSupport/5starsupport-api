@@ -459,8 +459,7 @@ async function route(args: {
     const auth = requireAuth(env, req.headers.get("authorization") ?? "");
     if (!auth.ok) return respondJson({ error: "unauthorized" }, 401, args.corsHeaders);
 
-    const workspaceId = safeText(url.searchParams.get("workspaceId"));
-    if (!workspaceId) return respondJson({ error: "missing_workspaceId" }, 400, args.corsHeaders);
+    const workspaceId = safeText(url.searchParams.get("workspaceId")) || "default";
 
     const meta = await getSyncMeta(store, workspaceId);
     const snapshot = await exportSnapshot(store);
@@ -485,8 +484,7 @@ async function route(args: {
     if (!auth.ok) return respondJson({ error: "unauthorized" }, 401, args.corsHeaders);
 
     const body = await safeJson(req);
-    const workspaceId = safeText(body?.workspaceId) || safeText(url.searchParams.get("workspaceId"));
-    if (!workspaceId) return respondJson({ error: "missing_workspaceId" }, 400, args.corsHeaders);
+    const workspaceId = safeText(body?.workspaceId) || safeText(url.searchParams.get("workspaceId")) || "default";
 
     const incoming = body?.snapshot as
       | { leads?: Lead[]; appointments?: Appointment[]; slots?: Record<string, SlotLock>; todos?: Todo[] }
