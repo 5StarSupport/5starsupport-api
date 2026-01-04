@@ -17,6 +17,11 @@ type Lead = {
   id: string;
   createdAt: string;
   updatedAt: string;
+
+  deletedAt?: string; // ✅ tombstone
+  updatedBy?: string; // ✅ conflict metadata
+  updatedDeviceId?: string; // ✅ conflict metadata
+
   source: "public";
   status: LeadStatus;
   name: string;
@@ -186,7 +191,6 @@ async function route(args: {
     const email = optionalString(body?.email);
     const phone = optionalString(body?.phone);
 
-    // ✅ server-side dedupe: primary id already unique; fallback email/phone
     const existingId = await findExistingLeadIdByContact(store, { email, phone });
     if (existingId) {
       await safeAppendLeadEvent(store, existingId, { type: "duplicate_submit_hot" });
@@ -195,18 +199,18 @@ async function route(args: {
 
     const leadId = crypto.randomUUID();
 
-    // reserve contact indexes (prevents races)
     const reserved = await reserveContactIndexes(store, { id: leadId, email, phone });
     if (!reserved.ok) {
-      // another lead won the race; return that id
       await safeAppendLeadEvent(store, reserved.existingId, { type: "duplicate_submit_hot" });
       return respondJson({ ok: true, leadId: reserved.existingId, deduped: true }, 200, args.corsHeaders);
     }
 
+    const now = nowIso();
     const lead: Lead = {
       id: leadId,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
+      createdAt: now,
+      updatedAt: now,
+      updatedBy: "public",
       source: "public",
       status: "hot",
       name,
@@ -216,7 +220,7 @@ async function route(args: {
       notes: optionalString(body?.notes),
       preferredDate: optionalString(body?.preferredDate),
       preferredTime: optionalString(body?.preferredTime),
-      timeline: [{ at: nowIso(), type: "hot_created" }],
+      timeline: [{ at: now, type: "hot_created" }],
     };
 
     const created = await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
@@ -264,10 +268,12 @@ async function route(args: {
       return respondJson({ ok: true, leadId: reserved.existingId, deduped: true }, 200, args.corsHeaders);
     }
 
+    const now = nowIso();
     const lead: Lead = {
       id: leadId,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
+      createdAt: now,
+      updatedAt: now,
+      updatedBy: "public",
       source: "public",
       status: "new",
       name,
@@ -277,7 +283,7 @@ async function route(args: {
       notes: optionalString(body?.notes),
       preferredDate: optionalString(body?.preferredDate),
       preferredTime: optionalString(body?.preferredTime),
-      timeline: [{ at: nowIso(), type: "created" }],
+      timeline: [{ at: now, type: "created" }],
     };
 
     const created = await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
@@ -360,6 +366,7 @@ async function route(args: {
         ...lead,
         status: lead.status === "landed" ? lead.status : "appointment",
         updatedAt: nowIso(),
+        updatedBy: "public",
         timeline: [...lead.timeline, { at: nowIso(), type: "appointment_created", note: appt.id }],
       }));
     }
@@ -469,7 +476,7 @@ async function route(args: {
     );
   }
 
-  // Sync Up (merge client changes)
+  // Sync Up (merge client changes) — full snapshot required (single source of truth)
   if (path === "/api/sync" && req.method === "POST") {
     if (!env.jwtSecret) return respondJson({ error: "misconfigured_jwt_secret" }, 500, args.corsHeaders);
 
@@ -483,10 +490,12 @@ async function route(args: {
     const incoming = body?.snapshot as
       | { leads?: Lead[]; appointments?: Appointment[]; slots?: Record<string, SlotLock>; todos?: Todo[] }
       | undefined;
-
     if (!incoming) return respondJson({ error: "missing_snapshot" }, 400, args.corsHeaders);
 
-    // Load server state
+    if (!isFullSnapshotShape(incoming)) {
+      return respondJson({ error: "full_snapshot_required" }, 400, args.corsHeaders);
+    }
+
     const server = await exportSnapshot(store);
 
     const merged = await mergeSnapshots(store, {
@@ -495,13 +504,11 @@ async function route(args: {
       actor: auth.payload.sub,
     });
 
-    // Persist merged snapshot (upserts only; does not delete)
     await persistMergedSnapshot(store, merged);
 
-    // Bump meta (version + updatedAt)
     const meta = await bumpSyncMeta(store, workspaceId);
-
     const latest = await exportSnapshot(store);
+
     return respondJson(
       {
         ok: true,
@@ -515,13 +522,14 @@ async function route(args: {
   }
 
   // ---- Pull-once leads endpoint (JWT required) ----
-  // POST /api/leads/pull -> returns only unpulled/unassigned, consumes them immediately (moves to pulled/)
+  // POST /api/leads/pull -> returns only unpulled/unassigned, consumes them immediately (archives + tombstones)
   if (path === "/api/leads/pull" && req.method === "POST") {
     if (!env.jwtSecret) return respondJson({ error: "misconfigured_jwt_secret" }, 500, args.corsHeaders);
 
     const auth = requireAuth(env, req.headers.get("authorization") ?? "");
     if (!auth.ok) return respondJson({ error: "unauthorized" }, 401, args.corsHeaders);
 
+    const deviceId = requestDeviceId(req);
     const body = await safeJson(req);
     const limit = clampInt(asString(body?.limit) ?? url.searchParams.get("limit"), 1, 200, 50);
     const status = (asString(body?.status) ?? url.searchParams.get("status") ?? "hot") as LeadStatus;
@@ -530,6 +538,7 @@ async function route(args: {
       limit,
       status,
       assignedTo: auth.payload.sub,
+      deviceId,
     });
 
     return respondJson({ ok: true, pulled: pulled.length, leads: pulled } as any, 200, args.corsHeaders);
@@ -541,6 +550,8 @@ async function route(args: {
 
     const auth = requireAuth(env, req.headers.get("authorization") ?? "");
     if (!auth.ok) return respondJson({ error: "unauthorized" }, 401, args.corsHeaders);
+
+    const deviceId = requestDeviceId(req);
 
     if (path === "/api/crm/leads" && req.method === "GET") {
       const status = url.searchParams.get("status");
@@ -568,15 +579,23 @@ async function route(args: {
         const followUpAt = optionalString(body?.followUpAt);
         const assignedTo = optionalString(body?.assignedTo);
 
-        const updated = await patchLead(store, id, (lead) => ({
-          ...lead,
-          updatedAt: nowIso(),
-          status: status ?? lead.status,
-          notes: notes ?? lead.notes,
-          followUpAt: followUpAt ?? lead.followUpAt,
-          assignedTo: assignedTo ?? lead.assignedTo,
-          timeline: [...lead.timeline, { at: nowIso(), type: "updated" }],
-        }));
+        const updated = await patchLead(store, id, (lead) => {
+          if (auth.payload.role !== "admin" && typeof assignedTo === "string" && assignedTo !== lead.assignedTo) {
+            throw new ForbiddenError("reassign_forbidden");
+          }
+
+          return {
+            ...lead,
+            updatedAt: nowIso(),
+            updatedBy: auth.payload.sub,
+            updatedDeviceId: deviceId ?? lead.updatedDeviceId,
+            status: status ?? lead.status,
+            notes: notes ?? lead.notes,
+            followUpAt: followUpAt ?? lead.followUpAt,
+            assignedTo: auth.payload.role === "admin" ? assignedTo ?? lead.assignedTo : lead.assignedTo,
+            timeline: [...lead.timeline, { at: nowIso(), type: "updated" }],
+          };
+        });
 
         if (!updated) return respondJson({ error: "not_found" }, 404, args.corsHeaders);
         return respondJson({ ok: true }, 200, args.corsHeaders);
@@ -695,6 +714,10 @@ async function route(args: {
         | undefined;
       if (!snapshot) return respondJson({ error: "missing_snapshot" }, 400, args.corsHeaders);
 
+      if (!isFullSnapshotShape(snapshot)) {
+        return respondJson({ error: "full_snapshot_required" }, 400, args.corsHeaders);
+      }
+
       await importSnapshot(store, snapshot);
       return respondJson({ ok: true }, 200, args.corsHeaders);
     }
@@ -809,7 +832,6 @@ async function rateLimit(
 ): Promise<{ ok: true } | { ok: false }> {
   const day = nowIso().slice(0, 10);
 
-  // IMPORTANT: bump prefix so old "0.0.0.0" counters are ignored
   const key = `ratelimit_v2/${day}/${hashShort(ip)}`;
 
   for (let i = 0; i < 5; i += 1) {
@@ -835,6 +857,10 @@ async function rateLimit(
 
 /* --------------------------------- Leads -------------------------------- */
 
+function isDeleted(lead: Lead): boolean {
+  return typeof lead.deletedAt === "string" && lead.deletedAt.length > 0;
+}
+
 function normalizeEmail(email?: string): string | null {
   const e = (email ?? "").trim().toLowerCase();
   return e.length ? e : null;
@@ -843,10 +869,7 @@ function normalizeEmail(email?: string): string | null {
 function normalizePhone(phone?: string): string | null {
   const p = (phone ?? "").trim();
   if (!p) return null;
-  // keep digits + leading +
-  const cleaned = p.startsWith("+")
-    ? "+" + p.slice(1).replace(/[^\d]/g, "")
-    : p.replace(/[^\d]/g, "");
+  const cleaned = p.startsWith("+") ? "+" + p.slice(1).replace(/[^\d]/g, "") : p.replace(/[^\d]/g, "");
   return cleaned.length ? cleaned : null;
 }
 
@@ -885,11 +908,9 @@ async function reserveContactIndexes(
   const e = normalizeEmail(opts.email);
   const p = normalizePhone(opts.phone);
 
-  // Fast check
   const existing = await findExistingLeadIdByContact(store, { email: e ?? undefined, phone: p ?? undefined });
   if (existing) return { ok: false, existingId: existing };
 
-  // Reserve email first
   if (e) {
     const key = leadByEmailKey(e);
     const res = await store.setJSON(key, { id: opts.id }, { onlyIfNew: true });
@@ -900,7 +921,6 @@ async function reserveContactIndexes(
     }
   }
 
-  // Reserve phone second; if fails, rollback email reserve
   if (p) {
     const key = leadByPhoneKey(p);
     const res = await store.setJSON(key, { id: opts.id }, { onlyIfNew: true });
@@ -955,6 +975,12 @@ async function safeAppendLeadEvent(
   } catch {}
 }
 
+class ForbiddenError extends Error {
+  constructor(public readonly code: string) {
+    super(code);
+  }
+}
+
 async function patchLead(
   store: ReturnType<typeof getStore>,
   id: string,
@@ -967,7 +993,14 @@ async function patchLead(
 
     if (!existing) return false;
 
-    const next = updater(existing.data);
+    let next: Lead;
+    try {
+      next = updater(existing.data);
+    } catch (e) {
+      if (e instanceof ForbiddenError) throw e;
+      throw e;
+    }
+
     const res = await store.setJSON(`leads/${id}`, next, { onlyIfMatch: existing.etag });
     if (res.modified) return true;
   }
@@ -991,6 +1024,8 @@ async function listLeads(
     const lead = (await store.get(`leads/${idx.id}`, { type: "json" })) as Lead | null;
     if (!lead) continue;
 
+    if (lead.deletedAt) continue;
+
     if (opts.status && lead.status !== opts.status) continue;
     if (opts.q && !matchesQuery(lead, opts.q)) continue;
 
@@ -1011,7 +1046,7 @@ function matchesQuery(lead: Lead, q: string): boolean {
 
 async function pullOnceConsumeLeads(
   store: ReturnType<typeof getStore>,
-  opts: { limit: number; status: LeadStatus; assignedTo: string },
+  opts: { limit: number; status: LeadStatus; assignedTo: string; deviceId: string | null },
 ): Promise<Lead[]> {
   const { blobs } = await store.list({ prefix: "indexes/leads/" });
   const keys = blobs.map((b) => b.key).sort().reverse();
@@ -1028,7 +1063,6 @@ async function pullOnceConsumeLeads(
     const claimed = await tryClaimLead(store, id, opts);
     if (!claimed) continue;
 
-    // consume: move to pulled/ and delete from main lead store + indexes
     await consumeLead(store, claimed);
     out.push(claimed);
   }
@@ -1039,7 +1073,7 @@ async function pullOnceConsumeLeads(
 async function tryClaimLead(
   store: ReturnType<typeof getStore>,
   id: string,
-  opts: { status: LeadStatus; assignedTo: string },
+  opts: { status: LeadStatus; assignedTo: string; deviceId: string | null },
 ): Promise<Lead | null> {
   for (let i = 0; i < 5; i += 1) {
     const existing = (await store.getWithMetadata(`leads/${id}`, { type: "json" })) as
@@ -1051,10 +1085,8 @@ async function tryClaimLead(
     const lead = existing.data;
     if (!lead) return null;
 
-    // Only pull unpulled/unassigned leads
+    if (lead.deletedAt) return null;
     if (lead.assignedTo) return null;
-
-    // Status filter (default "hot")
     if (opts.status && lead.status !== opts.status) return null;
 
     const ts = nowIso();
@@ -1064,10 +1096,11 @@ async function tryClaimLead(
       assignedTo: opts.assignedTo,
       pulledAt: ts,
       updatedAt: ts,
+      updatedBy: opts.assignedTo,
+      updatedDeviceId: opts.deviceId ?? lead.updatedDeviceId,
       timeline: [...(lead.timeline ?? []), { at: ts, type: "pulled", note: opts.assignedTo }],
     };
 
-    // CAS write
     const res = await store.setJSON(`leads/${id}`, next, { onlyIfMatch: existing.etag });
     if (res.modified) return next;
   }
@@ -1076,21 +1109,21 @@ async function tryClaimLead(
 }
 
 async function consumeLead(store: ReturnType<typeof getStore>, lead: Lead): Promise<void> {
-  // keep an audit copy
-  await store.setJSON(`pulled/${lead.id}`, lead, { onlyIfNew: true });
+  const ts = nowIso();
 
-  // delete main lead record
   try {
-    await store.delete(`leads/${lead.id}`);
+    await store.setJSON(`pulled/${lead.id}`, lead, { onlyIfNew: true });
   } catch {}
 
-  // delete lead timeline index entry (createdAt + id)
-  try {
-    await store.delete(`indexes/leads/${lead.createdAt}_${lead.id}`);
-  } catch {}
-
-  // delete contact indexes if they still point to this id
-  await releaseReservedContactIndexes(store, { id: lead.id, email: lead.email, phone: lead.phone });
+  await patchLead(store, lead.id, (l) => ({
+    ...l,
+    status: "archived",
+    deletedAt: ts,
+    updatedAt: ts,
+    updatedBy: lead.updatedBy ?? l.updatedBy,
+    updatedDeviceId: lead.updatedDeviceId ?? l.updatedDeviceId,
+    timeline: [...(l.timeline ?? []), { at: ts, type: "archived" }],
+  }));
 }
 
 /* ------------------------------ Appointments ----------------------------- */
@@ -1219,45 +1252,65 @@ async function importSnapshot(
   store: ReturnType<typeof getStore>,
   snapshot: { leads?: Lead[]; appointments?: Appointment[]; slots?: Record<string, SlotLock>; todos?: Todo[] },
 ): Promise<void> {
-  await deleteByPrefix(store, "leads/");
-  await deleteByPrefix(store, "appointments/");
-  await deleteByPrefix(store, "slots/");
-  await deleteByPrefix(store, "todos/");
-  await deleteByPrefix(store, "indexes/leads/");
-  await deleteByPrefix(store, "indexes/leadByEmail/");
-  await deleteByPrefix(store, "indexes/leadByPhone/");
+  // ✅ no hard deletes; import is idempotent upsert + lead tombstone for removals
+  const incomingLeads = Array.isArray(snapshot.leads) ? snapshot.leads : [];
+  const incomingIds = new Set(incomingLeads.map((l) => safeText(l?.id)).filter(Boolean));
 
-  for (const lead of snapshot.leads ?? []) {
-    await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
+  const { blobs: existingLeadBlobs } = await store.list({ prefix: "leads/" });
+  for (const b of existingLeadBlobs) {
+    const ex = (await store.get(b.key, { type: "json" })) as Lead | null;
+    if (!ex?.id) continue;
+    if (incomingIds.has(ex.id)) continue;
+    if (ex.deletedAt) continue;
+
+    await patchLead(store, ex.id, (l) => {
+      const ts = nowIso();
+      return {
+        ...l,
+        status: "archived",
+        deletedAt: ts,
+        updatedAt: ts,
+        updatedBy: "import",
+        timeline: [...(l.timeline ?? []), { at: ts, type: "archived", note: "missing_from_import" }],
+      };
+    });
+  }
+
+  for (const lead of incomingLeads) {
+    if (!lead?.id || !lead?.createdAt) continue;
+    const normalized: Lead = {
+      ...lead,
+      source: "public",
+      timeline: mergeTimeline([], lead.timeline),
+    };
+    await store.setJSON(`leads/${lead.id}`, normalized, { onlyIfNew: false } as any);
     await store.setJSON(
       `indexes/leads/${lead.createdAt}_${lead.id}`,
       { id: lead.id, createdAt: lead.createdAt },
-      { onlyIfNew: true },
+      { onlyIfNew: false } as any,
     );
 
     const e = normalizeEmail(lead.email);
     const p = normalizePhone(lead.phone);
-    if (e) await store.setJSON(leadByEmailKey(e), { id: lead.id }, { onlyIfNew: true });
-    if (p) await store.setJSON(leadByPhoneKey(p), { id: lead.id }, { onlyIfNew: true });
+    if (e) await store.setJSON(leadByEmailKey(e), { id: lead.id }, { onlyIfNew: false } as any);
+    if (p) await store.setJSON(leadByPhoneKey(p), { id: lead.id }, { onlyIfNew: false } as any);
   }
 
   for (const appt of snapshot.appointments ?? []) {
-    await store.setJSON(`appointments/${appt.id}`, appt, { onlyIfNew: true });
+    if (!appt?.id) continue;
+    await store.setJSON(`appointments/${appt.id}`, appt, { onlyIfNew: false } as any);
   }
 
   const slots = snapshot.slots ?? {};
   for (const [k, v] of Object.entries(slots)) {
-    await store.setJSON(k, v, { onlyIfNew: true });
+    if (!k) continue;
+    await store.setJSON(k, v, { onlyIfNew: false } as any);
   }
 
   for (const todo of snapshot.todos ?? []) {
-    await store.setJSON(`todos/${todo.id}`, todo, { onlyIfNew: true });
+    if (!todo?.id) continue;
+    await store.setJSON(`todos/${todo.id}`, todo, { onlyIfNew: false } as any);
   }
-}
-
-async function deleteByPrefix(store: ReturnType<typeof getStore>, prefix: string): Promise<void> {
-  const { blobs } = await store.list({ prefix });
-  for (const b of blobs) await store.delete(b.key);
 }
 
 /* ---------------------------------- Sync --------------------------------- */
@@ -1319,6 +1372,23 @@ function mergeTimeline(a: Lead["timeline"] | undefined, b: Lead["timeline"] | un
   return out;
 }
 
+function mergeLead(ex: Lead, inc: Lead): Lead {
+  if (ex.deletedAt || inc.deletedAt) {
+    const winner = ex.deletedAt ? ex : inc;
+    return {
+      ...winner,
+      deletedAt: ex.deletedAt || inc.deletedAt,
+      timeline: mergeTimeline(ex.timeline, inc.timeline),
+      updatedAt: nowIso(),
+    };
+  }
+
+  const newer = isoGt(inc.updatedAt, ex.updatedAt);
+  return newer
+    ? { ...ex, ...inc, timeline: mergeTimeline(ex.timeline, inc.timeline) }
+    : { ...inc, ...ex, timeline: mergeTimeline(ex.timeline, inc.timeline) };
+}
+
 async function mergeSnapshots(
   store: ReturnType<typeof getStore>,
   args: {
@@ -1332,17 +1402,12 @@ async function mergeSnapshots(
   const serverTodos = new Map(args.server.todos.map((t) => [t.id, t]));
   const mergedSlots: Record<string, SlotLock> = { ...(args.server.slots ?? {}) };
 
-  // Leads (dedupe by id primary; fallback email/phone)
   for (const inc of args.incoming.leads ?? []) {
     if (!inc?.id || !inc?.createdAt) continue;
 
     const ex = serverLeads.get(inc.id);
     if (ex) {
-      const newer = isoGt(inc.updatedAt, ex.updatedAt);
-      const next: Lead = newer
-        ? { ...ex, ...inc, timeline: mergeTimeline(ex.timeline, inc.timeline) }
-        : { ...inc, ...ex, timeline: mergeTimeline(ex.timeline, inc.timeline) };
-      serverLeads.set(inc.id, next);
+      serverLeads.set(inc.id, mergeLead(ex, inc));
       continue;
     }
 
@@ -1350,11 +1415,8 @@ async function mergeSnapshots(
     if (byContact) {
       const ex2 = serverLeads.get(byContact) || ((await store.get(`leads/${byContact}`, { type: "json" })) as Lead | null);
       if (ex2) {
-        const newer = isoGt(inc.updatedAt, ex2.updatedAt);
-        const next: Lead = newer
-          ? { ...ex2, ...inc, id: ex2.id, createdAt: ex2.createdAt, timeline: mergeTimeline(ex2.timeline, inc.timeline) }
-          : { ...inc, ...ex2, id: ex2.id, createdAt: ex2.createdAt, timeline: mergeTimeline(ex2.timeline, inc.timeline) };
-        serverLeads.set(ex2.id, next);
+        const incFixed: Lead = { ...inc, id: ex2.id, createdAt: ex2.createdAt };
+        serverLeads.set(ex2.id, mergeLead(ex2, incFixed));
         continue;
       }
     }
@@ -1365,11 +1427,8 @@ async function mergeSnapshots(
         serverLeads.get(reserve.existingId) ||
         ((await store.get(`leads/${reserve.existingId}`, { type: "json" })) as Lead | null);
       if (ex3) {
-        const newer = isoGt(inc.updatedAt, ex3.updatedAt);
-        const next: Lead = newer
-          ? { ...ex3, ...inc, id: ex3.id, createdAt: ex3.createdAt, timeline: mergeTimeline(ex3.timeline, inc.timeline) }
-          : { ...inc, ...ex3, id: ex3.id, createdAt: ex3.createdAt, timeline: mergeTimeline(ex3.timeline, inc.timeline) };
-        serverLeads.set(ex3.id, next);
+        const incFixed: Lead = { ...inc, id: ex3.id, createdAt: ex3.createdAt };
+        serverLeads.set(ex3.id, mergeLead(ex3, incFixed));
       }
       continue;
     }
@@ -1382,7 +1441,6 @@ async function mergeSnapshots(
     serverLeads.set(nextNew.id, nextNew);
   }
 
-  // Appointments (by id; pick newest updatedAt)
   for (const inc of args.incoming.appointments ?? []) {
     if (!inc?.id) continue;
     const ex = serverAppts.get(inc.id);
@@ -1393,7 +1451,6 @@ async function mergeSnapshots(
     serverAppts.set(inc.id, isoGt(inc.updatedAt, ex.updatedAt) ? inc : ex);
   }
 
-  // Todos (by id; pick newest updatedAt)
   for (const inc of args.incoming.todos ?? []) {
     if (!inc?.id) continue;
     const ex = serverTodos.get(inc.id);
@@ -1404,7 +1461,6 @@ async function mergeSnapshots(
     serverTodos.set(inc.id, isoGt(inc.updatedAt, ex.updatedAt) ? inc : ex);
   }
 
-  // Slots (union ids)
   const incomingSlots = args.incoming.slots ?? {};
   for (const [k, v] of Object.entries(incomingSlots)) {
     const a = mergedSlots[k]?.ids ?? [];
@@ -1427,6 +1483,7 @@ async function persistMergedSnapshot(
 ): Promise<void> {
   for (const lead of merged.leads) {
     if (!lead?.id || !lead?.createdAt) continue;
+
     await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: false } as any);
     await store.setJSON(
       `indexes/leads/${lead.createdAt}_${lead.id}`,
@@ -1436,8 +1493,8 @@ async function persistMergedSnapshot(
 
     const e = normalizeEmail(lead.email);
     const p = normalizePhone(lead.phone);
-    if (e) await store.setJSON(leadByEmailKey(e), { id: lead.id }, { onlyIfNew: true });
-    if (p) await store.setJSON(leadByPhoneKey(p), { id: lead.id }, { onlyIfNew: true });
+    if (e) await store.setJSON(leadByEmailKey(e), { id: lead.id }, { onlyIfNew: false } as any);
+    if (p) await store.setJSON(leadByPhoneKey(p), { id: lead.id }, { onlyIfNew: false } as any);
   }
 
   for (const appt of merged.appointments) {
@@ -1453,6 +1510,20 @@ async function persistMergedSnapshot(
     if (!todo?.id) continue;
     await store.setJSON(`todos/${todo.id}`, todo, { onlyIfNew: false } as any);
   }
+}
+
+function isFullSnapshotShape(v: any): v is {
+  leads: Lead[];
+  appointments: Appointment[];
+  slots: Record<string, SlotLock>;
+  todos: Todo[];
+} {
+  if (!v || typeof v !== "object") return false;
+  if (!Array.isArray(v.leads)) return false;
+  if (!Array.isArray(v.appointments)) return false;
+  if (!Array.isArray(v.todos)) return false;
+  if (!v.slots || typeof v.slots !== "object") return false;
+  return true;
 }
 
 /* --------------------------------- Auth --------------------------------- */
@@ -1571,7 +1642,7 @@ function buildCorsHeaders(env: EnvConfig, origin: string): Headers {
 
   if (allowOrigin) h.set("access-control-allow-origin", allowOrigin);
   h.set("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS");
-  h.set("access-control-allow-headers", "content-type,authorization");
+  h.set("access-control-allow-headers", "content-type,authorization,x-device-id");
   h.set("access-control-max-age", "86400");
   if (allowOrigin && allowOrigin !== "*") h.set("vary", "origin");
 
@@ -1626,6 +1697,13 @@ function optionalString(v: any): string | undefined {
 
 function safeText(v: any): string {
   return typeof v === "string" ? v.trim() : "";
+}
+
+function requestDeviceId(req: Request): string | null {
+  const raw = req.headers.get("x-device-id") ?? "";
+  const v = raw.trim();
+  if (!v) return null;
+  return /^[A-Za-z0-9_-]{1,64}$/.test(v) ? v : null;
 }
 
 function nowIso(): string {
