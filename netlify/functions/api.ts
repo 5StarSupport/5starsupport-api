@@ -113,14 +113,15 @@ export default async function handler(req: Request, context: Context) {
   const url = new URL(req.url);
   const path = normalizeApiPath(url.pathname);
 
-  // Always respond to health even if env vars are missing.
-  if (path === "/api/health" && req.method === "GET") {
-    return respondJson({ ok: true }, 200, buildCorsHeaders(readEnvSafe(), req.headers.get("origin") ?? ""));
-  }
-
   const env = readEnvSafe();
   const origin = req.headers.get("origin") ?? "";
-  const corsHeaders = buildCorsHeaders(env, origin);
+  const acrh = req.headers.get("access-control-request-headers") ?? "";
+  const corsHeaders = buildCorsHeaders(env, origin, acrh);
+
+  // Always respond to health even if env vars are missing.
+  if (path === "/api/health" && req.method === "GET") {
+    return respondJson({ ok: true }, 200, corsHeaders);
+  }
 
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
@@ -1635,18 +1636,109 @@ function envGet(key: string): string | null {
   return null;
 }
 
-function buildCorsHeaders(env: EnvConfig, origin: string): Headers {
+/**
+ * CORS (DROP-IN FIX)
+ * - Allows the CRM app's custom headers (x-client-name, x-client-version, x-workspace-id, etc.)
+ * - Echoes Access-Control-Request-Headers during preflight when provided
+ * - Supports ALLOWED_ORIGINS entries like:
+ *   - https://crm.5starsupport.co
+ *   - https://5starsupport.co
+ *   - *.5starsupport.co
+ *   - https://*.5starsupport.co
+ *   - *
+ */
+function buildCorsHeaders(env: EnvConfig, origin: string, accessControlRequestHeaders: string): Headers {
   const h = new Headers();
 
-  const allowOrigin = env.allowedOrigins === null ? "*" : env.allowedOrigins.includes(origin) ? origin : null;
-
+  const allowOrigin = computeAllowedOrigin(env, origin);
   if (allowOrigin) h.set("access-control-allow-origin", allowOrigin);
+
   h.set("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS");
-  h.set("access-control-allow-headers", "content-type,authorization,x-device-id");
+
+  // If browser sent requested headers, echo them back (covers any new custom headers)
+  const reqHeaders = (accessControlRequestHeaders ?? "").trim();
+  if (reqHeaders) {
+    h.set("access-control-allow-headers", reqHeaders);
+  } else {
+    // Fallback allow list (includes the CRM custom headers that triggered preflight)
+    h.set(
+      "access-control-allow-headers",
+      "content-type,authorization,x-device-id,x-client-name,x-client-version,x-workspace-id",
+    );
+  }
+
   h.set("access-control-max-age", "86400");
+
+  // Cache CORS by origin when not wildcard
   if (allowOrigin && allowOrigin !== "*") h.set("vary", "origin");
 
   return h;
+}
+
+function computeAllowedOrigin(env: EnvConfig, origin: string): string | null {
+  const o = (origin ?? "").trim();
+  if (!o) return null;
+
+  // If env.allowedOrigins is null -> allow everything (keeps your current behavior)
+  if (env.allowedOrigins === null) return "*";
+
+  const list = env.allowedOrigins.map((x) => (x ?? "").trim()).filter(Boolean);
+  if (list.length === 0) return null;
+
+  // Explicit wildcard
+  if (list.includes("*")) return "*";
+
+  // Exact match (most common)
+  if (list.includes(o)) return o;
+
+  // Wildcard / subdomain patterns
+  let originUrl: URL | null = null;
+  try {
+    originUrl = new URL(o);
+  } catch {
+    return null;
+  }
+
+  const originHost = originUrl.host;
+  const originProto = originUrl.protocol;
+
+  for (const rawPattern of list) {
+    const p = rawPattern.trim();
+    if (!p) continue;
+
+    // Handle patterns with scheme: https://*.example.com
+    if (p.includes("://")) {
+      let patternUrl: URL | null = null;
+      try {
+        // Replace wildcard host with a placeholder to parse
+        const tmp = p.replace("://*.", "://placeholder.");
+        patternUrl = new URL(tmp);
+      } catch {
+        patternUrl = null;
+      }
+
+      // If we can parse and the protocol differs, skip
+      if (patternUrl && patternUrl.protocol !== originProto) continue;
+
+      const hostPattern = p.split("://")[1] ?? "";
+      if (hostPattern.startsWith("*.")) {
+        const base = hostPattern.slice(2);
+        if (originHost === base) continue; // *.example.com does not match apex
+        if (originHost.endsWith("." + base)) return o;
+      }
+
+      continue;
+    }
+
+    // Handle patterns without scheme: *.example.com
+    if (p.startsWith("*.")) {
+      const base = p.slice(2);
+      if (originHost === base) continue;
+      if (originHost.endsWith("." + base)) return o;
+    }
+  }
+
+  return null;
 }
 
 function normalizeApiPath(pathname: string): string {
