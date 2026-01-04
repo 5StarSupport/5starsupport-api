@@ -192,31 +192,23 @@ async function route(args: {
 
     const email = optionalString(body?.email);
     const phone = optionalString(body?.phone);
+const message = optionalString(body?.message) ?? optionalString(body?.notes);
 
-    const existingId = await findExistingLeadIdByContact(store, { email, phone });
-    if (existingId) {
-  await patchLead(store, existingId, (l) => {
-    const ts = nowIso();
-    return {
-      ...l,
-      status: l.status === "hot" ? l.status : "hot",
-      updatedAt: ts,
-      updatedBy: "public",
-      timeline: [...(l.timeline ?? []), { at: ts, type: "promoted_hot" }],
-    };
-  });
 
-  return respondJson({ ok: true, leadId: existingId, deduped: true }, 200, corsHeaders);
+    const existingId = await findExistingLeadIdByMessage(store, message);
+if (existingId) {
+  await safeAppendLeadEvent(store, existingId, { type: "duplicate_submit_inquiry" });
+  return respondJson({ ok: true, leadId: existingId, deduped: true }, 200, args.corsHeaders);
 }
 
+const leadId = crypto.randomUUID();
 
-    const leadId = crypto.randomUUID();
+const reserved = await reserveMessageIndex(store, { id: leadId, message });
+if (!reserved.ok) {
+  await safeAppendLeadEvent(store, reserved.existingId, { type: "duplicate_submit_inquiry" });
+  return respondJson({ ok: true, leadId: reserved.existingId, deduped: true }, 200, args.corsHeaders);
+}
 
-    const reserved = await reserveContactIndexes(store, { id: leadId, email, phone });
-    if (!reserved.ok) {
-      await safeAppendLeadEvent(store, reserved.existingId, { type: "duplicate_submit_hot" });
-      return respondJson({ ok: true, leadId: reserved.existingId, deduped: true }, 200, args.corsHeaders);
-    }
 
     const now = nowIso();
     const lead: Lead = {
@@ -238,9 +230,9 @@ async function route(args: {
 
     const created = await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
     if (!created.modified) {
-      await releaseReservedContactIndexes(store, { id: leadId, email, phone });
-      return respondJson({ error: "create_failed" }, 500, args.corsHeaders);
-    }
+  await releaseReservedMessageIndex(store, { id: leadId, message });
+  return respondJson({ error: "create_failed" }, 500, args.corsHeaders);
+}
 
     await store.setJSON(
       `indexes/leads/${lead.createdAt}_${lead.id}`,
@@ -267,19 +259,23 @@ async function route(args: {
     const email = optionalString(body?.email);
     const phone = optionalString(body?.phone);
 
-    const existingId = await findExistingLeadIdByContact(store, { email, phone });
-    if (existingId) {
-      await safeAppendLeadEvent(store, existingId, { type: "duplicate_submit_inquiry" });
-      return respondJson({ ok: true, leadId: existingId, deduped: true }, 200, args.corsHeaders);
-    }
+const message = optionalString(body?.message) ?? optionalString(body?.notes);
 
-    const leadId = crypto.randomUUID();
 
-    const reserved = await reserveContactIndexes(store, { id: leadId, email, phone });
-    if (!reserved.ok) {
-      await safeAppendLeadEvent(store, reserved.existingId, { type: "duplicate_submit_inquiry" });
-      return respondJson({ ok: true, leadId: reserved.existingId, deduped: true }, 200, args.corsHeaders);
-    }
+    const existingId = await findExistingLeadIdByMessage(store, message);
+if (existingId) {
+  await safeAppendLeadEvent(store, existingId, { type: "duplicate_submit_inquiry" });
+  return respondJson({ ok: true, leadId: existingId, deduped: true }, 200, args.corsHeaders);
+}
+
+const leadId = crypto.randomUUID();
+
+const reserved = await reserveMessageIndex(store, { id: leadId, message });
+if (!reserved.ok) {
+  await safeAppendLeadEvent(store, reserved.existingId, { type: "duplicate_submit_inquiry" });
+  return respondJson({ ok: true, leadId: reserved.existingId, deduped: true }, 200, args.corsHeaders);
+}
+
 
     const now = nowIso();
     const lead: Lead = {
@@ -301,9 +297,9 @@ async function route(args: {
 
     const created = await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
     if (!created.modified) {
-      await releaseReservedContactIndexes(store, { id: leadId, email, phone });
-      return respondJson({ error: "create_failed" }, 500, args.corsHeaders);
-    }
+  await releaseReservedMessageIndex(store, { id: leadId, message });
+  return respondJson({ error: "create_failed" }, 500, args.corsHeaders);
+}
 
     await store.setJSON(
       `indexes/leads/${lead.createdAt}_${lead.id}`,
@@ -871,6 +867,59 @@ async function rateLimit(
 function isDeleted(lead: Lead): boolean {
   return typeof lead.deletedAt === "string" && lead.deletedAt.length > 0;
 }
+
+function normalizeMessage(msg?: string): string | null {
+  const m = (msg ?? "").trim().toLowerCase();
+  const compact = m.replace(/\s+/g, " ");
+  return compact.length ? compact : null;
+}
+
+function leadByMessageKey(message: string): string {
+  return `indexes/leadByMessage/${sha256Hex(message)}`;
+}
+
+async function findExistingLeadIdByMessage(
+  store: ReturnType<typeof getStore>,
+  message?: string,
+): Promise<string | null> {
+  const m = normalizeMessage(message);
+  if (!m) return null;
+  const idx = (await store.get(leadByMessageKey(m), { type: "json" })) as { id?: string } | null;
+  const id = safeText(idx?.id);
+  return id || null;
+}
+
+async function reserveMessageIndex(
+  store: ReturnType<typeof getStore>,
+  opts: { id: string; message?: string },
+): Promise<{ ok: true } | { ok: false; existingId: string }> {
+  const m = normalizeMessage(opts.message);
+  if (!m) return { ok: true }; // no message => no dedupe
+
+  const key = leadByMessageKey(m);
+  const res = await store.setJSON(key, { id: opts.id }, { onlyIfNew: true });
+
+  if (res.modified) return { ok: true };
+
+  const idx = (await store.get(key, { type: "json" })) as { id?: string } | null;
+  const existingId = safeText(idx?.id) || opts.id;
+  return { ok: false, existingId };
+}
+
+async function releaseReservedMessageIndex(
+  store: ReturnType<typeof getStore>,
+  opts: { id: string; message?: string },
+): Promise<void> {
+  const m = normalizeMessage(opts.message);
+  if (!m) return;
+
+  try {
+    const key = leadByMessageKey(m);
+    const idx = (await store.get(key, { type: "json" })) as { id?: string } | null;
+    if (safeText(idx?.id) === opts.id) await store.delete(key);
+  } catch {}
+}
+
 
 function normalizeEmail(email?: string): string | null {
   const e = (email ?? "").trim().toLowerCase();
