@@ -18,9 +18,11 @@ type Lead = {
   createdAt: string;
   updatedAt: string;
 
-  deletedAt?: string; // ✅ tombstone
-  updatedBy?: string; // ✅ conflict metadata
-  updatedDeviceId?: string; // ✅ conflict metadata
+  deletedAt?: string;
+  archivedAt?: string; // ✅ add this if you want it
+
+  updatedBy?: string;
+  updatedDeviceId?: string;
 
   source: "public";
   status: LeadStatus;
@@ -33,7 +35,6 @@ type Lead = {
   preferredTime?: string;
   followUpAt?: string;
 
-  // pull-once / assignment
   assignedTo?: string;
   pulledAt?: string;
 
@@ -194,9 +195,20 @@ async function route(args: {
 
     const existingId = await findExistingLeadIdByContact(store, { email, phone });
     if (existingId) {
-      await safeAppendLeadEvent(store, existingId, { type: "duplicate_submit_hot" });
-      return respondJson({ ok: true, leadId: existingId, deduped: true }, 200, args.corsHeaders);
-    }
+  await patchLead(store, existingId, (l) => {
+    const ts = nowIso();
+    return {
+      ...l,
+      status: l.status === "hot" ? l.status : "hot",
+      updatedAt: ts,
+      updatedBy: "public",
+      timeline: [...(l.timeline ?? []), { at: ts, type: "promoted_hot" }],
+    };
+  });
+
+  return respondJson({ ok: true, leadId: existingId, deduped: true }, 200, corsHeaders);
+}
+
 
     const leadId = crypto.randomUUID();
 
