@@ -1078,7 +1078,7 @@ async function listLeads(
   const leads: Lead[] = [];
   for (const k of keys) {
     if (leads.length >= opts.limit) break;
-    const idx = (await store.get(k, { type: "json" })) as { id: string } | null;
+    const idx = (await store.get(decodeBlobKey(k), { type: "json" })) as { id: string } | null;
     if (!idx?.id) continue;
 
     const lead = (await store.get(`leads/${idx.id}`, { type: "json" })) as Lead | null;
@@ -1116,7 +1116,7 @@ async function pullOnceConsumeLeads(
   for (const k of keys) {
     if (out.length >= opts.limit) break;
 
-    const idx = (await store.get(k, { type: "json" })) as { id?: string; createdAt?: string } | null;
+    const idx = (await store.get(decodeBlobKey(k), { type: "json" })) as { id?: string; createdAt?: string } | null;
     const id = safeText(idx?.id);
     if (!id) continue;
 
@@ -1854,6 +1854,15 @@ function optionalString(v: any): string | undefined {
 function safeText(v: any): string {
   return typeof v === "string" ? v.trim() : "";
 }
+
+function decodeBlobKey(key: string): string {
+  try {
+    return decodeURIComponent(key);
+  } catch {
+    return key;
+  }
+}
+
 
 function requestDeviceId(req: Request): string | null {
   const raw = req.headers.get("x-device-id") ?? "";

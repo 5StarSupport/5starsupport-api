@@ -1,35 +1,26 @@
-// file: netlify/functions/lead_finder.ts
-import type { Handler } from "@netlify/functions";
+/* File: netlify/functions/lead_finder.ts */
 
-export const handler: Handler = async (event) => {
-  return {
-    statusCode: 200,
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      ok: true,
-      function: "lead_finder",
-      method: event.httpMethod,
-      path: event.path,
-      ts: new Date().toISOString(),
-    }),
-  };
+import type { Context } from "@netlify/functions";
+import { getStore } from "@netlify/blobs";
+import crypto from "node:crypto";
+
+type JwtPayload = {
+  sub: string;
+  role: "admin" | "staff";
+  iat: number;
+  exp: number;
 };
 
+type LeadFinderProvider = "google_places";
+type GeoType = "city" | "latlng";
 
-//// file: src/lead-finder/types.ts
-export type LeadFinderProvider = "google_places";
-
-export type LeadFinderRunStatus =
-  | "queued"
-  | "running"
-  | "completed"
-  | "failed"
-  | "cancelled";
-
-export type GeoType = "city" | "latlng";
-
-export interface LeadFinderProfile {
+type LeadFinderProfile = {
   id: string;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string;
+  updatedBy: string;
+
   name: string;
   industryId: string;
   subIndustryId: string | null;
@@ -44,17 +35,19 @@ export interface LeadFinderProfile {
 
   requirePhone: boolean;
   requireNoWebsite: boolean;
-}
+};
 
-export interface LeadFinderRun {
+type LeadFinderRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+
+type LeadFinderRun = {
   id: string;
-  profileId: string;
-  status: LeadFinderRunStatus;
-  provider: LeadFinderProvider;
-  requestedByUserId: string;
+  createdAt: string;
+  updatedAt: string;
+  requestedBy: string;
 
-  startedAt: Date | null;
-  finishedAt: Date | null;
+  profileId: string;
+  provider: LeadFinderProvider;
+  status: LeadFinderRunStatus;
 
   statsTotalSeen: number;
   statsQualified: number;
@@ -64,708 +57,625 @@ export interface LeadFinderRun {
   statsHasWebsite: number;
 
   errorMessage: string | null;
-}
+};
 
-export interface ProviderBusiness {
-  provider: LeadFinderProvider;
-  providerPlaceId: string;
+type CrmLeadStatus = "hot" | "new" | "follow_up" | "appointment" | "landed" | "no" | "archived";
+type CrmLead = {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  updatedBy?: string;
+  updatedDeviceId?: string;
+  source: "public";
+  status: CrmLeadStatus;
+  name: string;
+  phone?: string;
+  email?: string;
+  service?: string;
+  notes?: string;
+  preferredDate?: string;
+  preferredTime?: string;
+  followUpAt?: string;
+  assignedTo?: string;
+  pulledAt?: string;
+  timeline: Array<{ at: string; type: string; note?: string }>;
+};
 
-  businessName: string;
-  phoneRaw: string | null;
-  websiteUrl: string | null;
-  addressFull: string | null;
-}
+const STORE_NAME = "crm";
+const CONSISTENCY: "strong" = "strong";
 
-export type RunItemDecision =
-  | "inserted"
-  | "skipped_missing_phone"
-  | "skipped_has_website"
-  | "skipped_duplicate"
-  | "skipped_invalid";
+export default async function handler(req: Request, _context: Context) {
+  const url = new URL(req.url);
+  const path = normalizeFnPath(url.pathname);
+  const cors = buildCorsHeaders(req);
 
-export interface NormalizedBusiness {
-  provider: LeadFinderProvider;
-  providerPlaceId: string;
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
 
-  businessName: string;
-  phoneRaw: string | null;
-  phoneE164: string | null;
-  websiteUrl: string | null;
-  addressFull: string | null;
-}
+  const auth = requireAuth(req.headers.get("authorization") ?? "");
+  if (!auth.ok) return respondJson({ error: "unauthorized" }, 401, cors);
 
-//// file: src/lead-finder/db/pool.ts
-import { Pool } from "pg";
+  const store = getStore({ name: STORE_NAME, consistency: CONSISTENCY });
 
-export function createPgPool() {
-  const connectionString = process.env.DATABASE_URL;
-  if (!connectionString) throw new Error("DATABASE_URL is required");
-  return new Pool({ connectionString });
-}
-
-//// file: src/lead-finder/db/repo.ts
-import type { Pool, PoolClient } from "pg";
-import type {
-  LeadFinderProfile,
-  LeadFinderRun,
-  LeadFinderRunStatus,
-  NormalizedBusiness,
-  RunItemDecision,
-} from "../types.js";
-
-function toProfile(row: any): LeadFinderProfile {
-  return {
-    id: row.id,
-    name: row.name,
-    industryId: row.industry_id,
-    subIndustryId: row.sub_industry_id,
-    geoType: row.geo_type,
-    city: row.city,
-    state: row.state,
-    country: row.country,
-    centerLat: row.center_lat,
-    centerLng: row.center_lng,
-    radiusMeters: row.radius_meters,
-    requirePhone: row.require_phone,
-    requireNoWebsite: row.require_no_website,
-  };
-}
-
-function toRun(row: any): LeadFinderRun {
-  return {
-    id: row.id,
-    profileId: row.profile_id,
-    status: row.status,
-    provider: row.provider,
-    requestedByUserId: row.requested_by_user_id,
-    startedAt: row.started_at,
-    finishedAt: row.finished_at,
-    statsTotalSeen: row.stats_total_seen,
-    statsQualified: row.stats_qualified,
-    statsInserted: row.stats_inserted,
-    statsDuplicates: row.stats_duplicates,
-    statsMissingPhone: row.stats_missing_phone,
-    statsHasWebsite: row.stats_has_website,
-    errorMessage: row.error_message,
-  };
-}
-
-export class LeadFinderRepo {
-  constructor(private readonly pool: Pool) {}
-
-  async getProfile(profileId: string): Promise<LeadFinderProfile | null> {
-    const { rows } = await this.pool.query(
-      `select * from lead_finder_profiles where id = $1`,
-      [profileId],
+  if (req.method === "GET" && path === "/") {
+    return respondJson(
+      { ok: true, function: "lead_finder", user: auth.payload.sub, role: auth.payload.role },
+      200,
+      cors,
     );
-    return rows[0] ? toProfile(rows[0]) : null;
   }
 
-  async createRun(input: {
-    profileId: string;
-    requestedByUserId: string;
-    provider: string;
-  }): Promise<LeadFinderRun> {
-    const { rows } = await this.pool.query(
-      `
-      insert into lead_finder_runs (profile_id, status, provider, requested_by_user_id)
-      values ($1, 'queued', $2, $3)
-      returning *
-      `,
-      [input.profileId, input.provider, input.requestedByUserId],
+  // ---------------- Debug (admin-only) ----------------
+
+  if (req.method === "GET" && path === "/debug/blobs") {
+    if (auth.payload.role !== "admin") return respondJson({ error: "forbidden" }, 403, cors);
+
+    const prefix = (url.searchParams.get("prefix") ?? "").trim();
+    const limit = clampInt(url.searchParams.get("limit"), 1, 2000, 500);
+
+    const { blobs, directories } = await store.list({ prefix });
+    const keys = blobs.map((b) => b.key).sort().slice(0, limit);
+
+    return respondJson(
+      { ok: true, prefix, count: keys.length, keys, directories: (directories ?? []).slice(0, 200) },
+      200,
+      cors,
     );
-    return toRun(rows[0]);
   }
 
-  async getRun(runId: string): Promise<LeadFinderRun | null> {
-    const { rows } = await this.pool.query(
-      `select * from lead_finder_runs where id = $1`,
-      [runId],
-    );
-    return rows[0] ? toRun(rows[0]) : null;
-  }
+  if (req.method === "POST" && path === "/debug/backfill-indexes") {
+    if (auth.payload.role !== "admin") return respondJson({ error: "forbidden" }, 403, cors);
 
-  async cancelRun(runId: string): Promise<boolean> {
-    const { rowCount } = await this.pool.query(
-      `
-      update lead_finder_runs
-      set status = 'cancelled', finished_at = now()
-      where id = $1 and status in ('queued','running')
-      `,
-      [runId],
-    );
-    return rowCount === 1;
-  }
+    const limit = clampInt(url.searchParams.get("limit"), 1, 10_000, 1000);
 
-  async claimNextQueuedRun(provider: string): Promise<LeadFinderRun | null> {
-    const client = await this.pool.connect();
-    try {
-      await client.query("begin");
-      const { rows } = await client.query(
-        `
-        select *
-        from lead_finder_runs
-        where status = 'queued' and provider = $1
-        order by created_at asc
-        for update skip locked
-        limit 1
-        `,
-        [provider],
-      );
+    const { blobs } = await store.list({ prefix: "leads/" });
+    const leadKeys = blobs.map((b) => b.key).sort().reverse().slice(0, limit);
 
-      if (!rows[0]) {
-        await client.query("commit");
-        return null;
+    let scanned = 0;
+    let created = 0;
+    let skipped = 0;
+
+    for (const k of leadKeys) {
+      scanned += 1;
+
+      const lead = (await store.get(k, { type: "json" })) as CrmLead | null;
+      if (!lead?.id || !lead.createdAt) {
+        skipped += 1;
+        continue;
       }
 
-      const runId = rows[0].id as string;
-      const { rows: updated } = await client.query(
-        `
-        update lead_finder_runs
-        set status = 'running', started_at = now()
-        where id = $1
-        returning *
-        `,
-        [runId],
-      );
+      const idxKey = `indexes/leads/${lead.createdAt}_${lead.id}`;
+      const res = await store.setJSON(idxKey, { id: lead.id, createdAt: lead.createdAt }, { onlyIfNew: true });
+      if (res.modified) created += 1;
+      else skipped += 1;
+    }
 
-      await client.query("commit");
-      return toRun(updated[0]);
-    } catch (e) {
-      await client.query("rollback");
-      throw e;
-    } finally {
-      client.release();
+    return respondJson({ ok: true, scanned, created, skipped }, 200, cors);
+  }
+
+  // ---------------- Profiles ----------------
+
+  if (req.method === "POST" && path === "/profiles") {
+    const body = await safeJson(req);
+
+    const name = requiredString(body?.name);
+    const industryId = requiredString(body?.industryId);
+    const subIndustryId = optionalString(body?.subIndustryId);
+
+    const geoType = (requiredString(body?.geoType) ?? "city") as GeoType;
+    const city = optionalString(body?.city);
+    const state = optionalString(body?.state);
+    const country = optionalString(body?.country);
+    const centerLat = optionalNumber(body?.centerLat);
+    const centerLng = optionalNumber(body?.centerLng);
+
+    const radiusMeters = clampInt(String(body?.radiusMeters ?? ""), 1, 200_000, 5_000);
+    const requirePhone = optionalBool(body?.requirePhone) ?? true;
+    const requireNoWebsite = optionalBool(body?.requireNoWebsite) ?? true;
+
+    if (!name) return respondJson({ error: "missing_name" }, 400, cors);
+    if (!industryId) return respondJson({ error: "missing_industryId" }, 400, cors);
+
+    if (geoType === "city") {
+      if (!city) return respondJson({ error: "missing_city" }, 400, cors);
+    } else {
+      if (centerLat == null || centerLng == null) {
+        return respondJson({ error: "missing_centerLat_centerLng" }, 400, cors);
+      }
+    }
+
+    const profile = await createProfile(store, {
+      name,
+      industryId,
+      subIndustryId,
+      geoType,
+      city: city ?? null,
+      state: state ?? null,
+      country: country ?? null,
+      centerLat: centerLat ?? null,
+      centerLng: centerLng ?? null,
+      radiusMeters,
+      requirePhone,
+      requireNoWebsite,
+      actor: auth.payload.sub,
+    });
+
+    return respondJson({ ok: true, profile }, 201, cors);
+  }
+
+  if (req.method === "GET" && path === "/profiles") {
+    const limit = clampInt(url.searchParams.get("limit"), 1, 200, 50);
+    const profiles = await listProfiles(store, limit);
+    return respondJson({ ok: true, profiles }, 200, cors);
+  }
+
+  {
+    const m = path.match(/^\/profiles\/([^/]+)$/);
+    if (req.method === "GET" && m) {
+      const id = decodeURIComponent(m[1]);
+      const profile = (await store.get(profileKey(id), { type: "json" })) as LeadFinderProfile | null;
+      if (!profile) return respondJson({ error: "not_found" }, 404, cors);
+      return respondJson({ ok: true, profile }, 200, cors);
     }
   }
 
-  async setRunStatus(runId: string, status: LeadFinderRunStatus, error?: string) {
-    await this.pool.query(
-      `
-      update lead_finder_runs
-      set status = $2,
-          error_message = $3,
-          finished_at = case when $2 in ('completed','failed','cancelled') then now() else finished_at end
-      where id = $1
-      `,
-      [runId, status, error ?? null],
-    );
+  // ---------------- Runs ----------------
+
+  if (req.method === "POST" && path === "/runs") {
+    const body = await safeJson(req);
+
+    const profileId = requiredString(body?.profileId);
+    if (!profileId) return respondJson({ error: "profileId_required" }, 400, cors);
+
+    const provider = (optionalString(body?.provider) ?? "google_places") as LeadFinderProvider;
+
+    const profile = (await store.get(profileKey(profileId), { type: "json" })) as LeadFinderProfile | null;
+    if (!profile) return respondJson({ error: "profile_not_found" }, 404, cors);
+
+    const run = await createRun(store, {
+      profileId,
+      provider,
+      actor: auth.payload.sub,
+    });
+
+    return respondJson({ ok: true, run }, 201, cors);
   }
 
-  async bumpRunStats(runId: string, delta: Partial<Record<
-    | "statsTotalSeen"
-    | "statsQualified"
-    | "statsInserted"
-    | "statsDuplicates"
-    | "statsMissingPhone"
-    | "statsHasWebsite",
-    number
-  >>) {
-    const fields = Object.entries(delta).filter(([, v]) => typeof v === "number");
-    if (fields.length === 0) return;
-
-    const sets = fields
-      .map(([k], i) => {
-        const col = k
-          .replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`)
-          .toLowerCase();
-        return `${col} = ${col} + $${i + 2}`;
-      })
-      .join(", ");
-
-    const values = fields.map(([, v]) => v as number);
-    await this.pool.query(
-      `update lead_finder_runs set ${sets} where id = $1`,
-      [runId, ...values],
-    );
+  if (req.method === "GET" && path === "/runs") {
+    const limit = clampInt(url.searchParams.get("limit"), 1, 200, 50);
+    const runs = await listRuns(store, limit);
+    return respondJson({ ok: true, runs }, 200, cors);
   }
 
-  async isDuplicate(
-    client: PoolClient,
-    input: { provider: string; providerPlaceId: string; phoneE164: string | null; name: string; addressFull: string | null },
-  ): Promise<boolean> {
-    const byProvider = await client.query(
-      `
-      select 1
-      from lead_external_ids
-      where provider = $1 and provider_place_id = $2
-      limit 1
-      `,
-      [input.provider, input.providerPlaceId],
-    );
-    if (byProvider.rowCount) return true;
-
-    if (input.phoneE164) {
-      const byPhone = await client.query(
-        `select 1 from lead_dedupe_keys where key_type = 'phone' and dedupe_key = $1 limit 1`,
-        [input.phoneE164],
-      );
-      if (byPhone.rowCount) return true;
-    }
-
-    if (input.addressFull) {
-      const key = `${normalizeKey(input.name)}|${normalizeKey(input.addressFull)}`;
-      const byNameAddr = await client.query(
-        `select 1 from lead_dedupe_keys where key_type = 'name_address' and dedupe_key = $1 limit 1`,
-        [key],
-      );
-      if (byNameAddr.rowCount) return true;
-    }
-
-    return false;
-  }
-
-  async insertLeadAndAudit(
-    client: PoolClient,
-    runId: string,
-    profile: LeadFinderProfile,
-    b: NormalizedBusiness,
-    decision: RunItemDecision,
-    leadId?: string,
-  ) {
-    await client.query(
-      `
-      insert into lead_finder_run_items (
-        run_id, provider, provider_place_id, business_name,
-        phone_raw, phone_e164, website_url, address_full,
-        decision, lead_id
-      ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-      `,
-      [
-        runId,
-        b.provider,
-        b.providerPlaceId,
-        b.businessName,
-        b.phoneRaw,
-        b.phoneE164,
-        b.websiteUrl,
-        b.addressFull,
-        decision,
-        leadId ?? null,
-      ],
-    );
-
-    if (decision !== "inserted" || !leadId) return;
-
-    await client.query(
-      `insert into lead_external_ids (lead_id, provider, provider_place_id) values ($1,$2,$3) on conflict do nothing`,
-      [leadId, b.provider, b.providerPlaceId],
-    );
-
-    if (b.phoneE164) {
-      await client.query(
-        `insert into lead_dedupe_keys (lead_id, key_type, dedupe_key) values ($1,'phone',$2) on conflict do nothing`,
-        [leadId, b.phoneE164],
-      );
-    }
-
-    if (b.addressFull) {
-      const key = `${normalizeKey(b.businessName)}|${normalizeKey(b.addressFull)}`;
-      await client.query(
-        `insert into lead_dedupe_keys (lead_id, key_type, dedupe_key) values ($1,'name_address',$2) on conflict do nothing`,
-        [leadId, key],
-      );
+  {
+    const m = path.match(/^\/runs\/([^/]+)$/);
+    if (req.method === "GET" && m) {
+      const id = decodeURIComponent(m[1]);
+      const run = (await store.get(runKey(id), { type: "json" })) as LeadFinderRun | null;
+      if (!run) return respondJson({ error: "not_found" }, 404, cors);
+      return respondJson({ ok: true, run }, 200, cors);
     }
   }
 
-  async createColdLead(
-    client: PoolClient,
-    runId: string,
-    profile: LeadFinderProfile,
-    b: NormalizedBusiness,
-  ): Promise<string> {
-    const { rows } = await client.query(
-      `
-      insert into leads (
-        status, industry_id, sub_industry_id,
-        business_name, phone_e164, website_url, address_full,
-        source, source_run_id
-      ) values (
-        'cold', $1, $2, $3, $4, $5, $6,
-        'lead_finder', $7
-      )
-      returning id
-      `,
-      [
-        profile.industryId,
-        profile.subIndustryId,
-        b.businessName,
-        b.phoneE164,
-        b.websiteUrl,
-        b.addressFull,
-        runId,
-      ],
-    );
-    return rows[0].id as string;
+  // POST /runs/:id/cancel
+  {
+    const m = path.match(/^\/runs\/([^/]+)\/cancel$/);
+    if (req.method === "POST" && m) {
+      const runId = decodeURIComponent(m[1]);
+
+      const existing = (await store.get(runKey(runId), { type: "json" })) as LeadFinderRun | null;
+      if (!existing) return respondJson({ error: "not_found" }, 404, cors);
+
+      if (existing.status === "completed" || existing.status === "failed") {
+        return respondJson({ ok: true, run: existing }, 200, cors);
+      }
+
+      const cancelled = await patchRun(store, runId, (r) => ({
+        ...r,
+        status: "cancelled",
+        updatedAt: nowIso(),
+      }));
+
+      return respondJson({ ok: true, run: cancelled }, 200, cors);
+    }
   }
+
+  // POST /runs/:id/execute  (simulation)
+  {
+    const m = path.match(/^\/runs\/([^/]+)\/execute$/);
+    if (req.method === "POST" && m) {
+      const runId = decodeURIComponent(m[1]);
+      const body = await safeJson(req);
+
+      const requestedInsertCount = clampInt(String(body?.insertCount ?? ""), 0, 500, 10);
+
+      const existing = (await store.get(runKey(runId), { type: "json" })) as LeadFinderRun | null;
+      if (!existing) return respondJson({ error: "not_found" }, 404, cors);
+
+      if (existing.status === "cancelled") return respondJson({ ok: true, run: existing }, 200, cors);
+
+      const profile = (await store.get(profileKey(existing.profileId), { type: "json" })) as LeadFinderProfile | null;
+      if (!profile) return respondJson({ error: "profile_not_found" }, 404, cors);
+
+      const running = await patchRun(store, runId, (r) => ({
+        ...r,
+        status: "running",
+        updatedAt: nowIso(),
+        errorMessage: null,
+      }));
+
+      const totalSeen = Math.max(running.statsTotalSeen, requestedInsertCount * 3);
+      const qualified = Math.max(running.statsQualified, requestedInsertCount * 2);
+      const hasWebsite = Math.floor(requestedInsertCount / 3);
+      const missingPhone = Math.floor(requestedInsertCount / 4);
+
+      const insertedIds: string[] = [];
+      const indexKeysCreated: string[] = [];
+
+      for (let i = 0; i < requestedInsertCount; i += 1) {
+        const leadId = crypto.randomUUID();
+        const lead = buildSimulatedLead({
+          id: leadId,
+          actor: auth.payload.sub,
+          profile,
+          idx: i,
+        });
+
+        const created = await store.setJSON(`leads/${lead.id}`, lead, { onlyIfNew: true });
+        if (!created.modified) continue;
+
+        // ✅ MUST match api.ts format exactly
+        const crmIndexKey = `indexes/leads/${lead.createdAt}_${lead.id}`;
+        const idxRes = await store.setJSON(
+          crmIndexKey,
+          { id: lead.id, createdAt: lead.createdAt },
+          { onlyIfNew: true },
+        );
+
+        if (idxRes.modified) indexKeysCreated.push(crmIndexKey);
+        insertedIds.push(lead.id);
+      }
+
+      const completed = await patchRun(store, runId, (r) => ({
+        ...r,
+        status: "completed",
+        updatedAt: nowIso(),
+        statsTotalSeen: totalSeen,
+        statsQualified: qualified,
+        statsInserted: r.statsInserted + insertedIds.length,
+        statsHasWebsite: r.statsHasWebsite + hasWebsite,
+        statsMissingPhone: r.statsMissingPhone + missingPhone,
+      }));
+
+      return respondJson(
+        { ok: true, run: completed, insertedLeadIds: insertedIds, indexKeysCreated },
+        200,
+        cors,
+      );
+    }
+  }
+
+  return respondJson({ error: "not_found" }, 404, cors);
 }
 
-function normalizeKey(s: string) {
-  return s.trim().toLowerCase().replace(/\s+/g, " ");
+/* ------------------------------- Storage -------------------------------- */
+
+function profileKey(id: string): string {
+  return `lead_finder/profiles/${id}`;
+}
+function profileIndexKey(tsKey: string, id: string): string {
+  return `lead_finder/indexes/profiles/${tsKey}_${id}`;
 }
 
-//// file: src/lead-finder/normalize.ts
-import type { ProviderBusiness, NormalizedBusiness } from "./types.js";
+function runKey(id: string): string {
+  return `lead_finder/runs/${id}`;
+}
+function runIndexKey(tsKey: string, id: string): string {
+  return `lead_finder/indexes/runs/${tsKey}_${id}`;
+}
 
-export function normalizeBusiness(b: ProviderBusiness): NormalizedBusiness {
+function tsKeyNow(): string {
+  return String(Date.now()).padStart(13, "0");
+}
+
+async function createProfile(
+  store: ReturnType<typeof getStore>,
+  input: Omit<LeadFinderProfile, "id" | "createdAt" | "updatedAt" | "createdBy" | "updatedBy"> & { actor: string },
+): Promise<LeadFinderProfile> {
+  for (let i = 0; i < 5; i += 1) {
+    const id = crypto.randomUUID();
+    const now = nowIso();
+    const tsKey = tsKeyNow();
+
+    const profile: LeadFinderProfile = {
+      id,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: input.actor,
+      updatedBy: input.actor,
+
+      name: input.name,
+      industryId: input.industryId,
+      subIndustryId: input.subIndustryId,
+
+      geoType: input.geoType,
+      city: input.city,
+      state: input.state,
+      country: input.country,
+      centerLat: input.centerLat,
+      centerLng: input.centerLng,
+      radiusMeters: input.radiusMeters,
+
+      requirePhone: input.requirePhone,
+      requireNoWebsite: input.requireNoWebsite,
+    };
+
+    const res = await store.setJSON(profileKey(id), profile, { onlyIfNew: true });
+    if (!res.modified) continue;
+
+    await store.setJSON(profileIndexKey(tsKey, id), { id, createdAt: now }, { onlyIfNew: true });
+    return profile;
+  }
+
+  throw new Error("failed_to_create_profile");
+}
+
+async function listProfiles(store: ReturnType<typeof getStore>, limit: number): Promise<LeadFinderProfile[]> {
+  const { blobs } = await store.list({ prefix: "lead_finder/indexes/profiles/" });
+  const indexKeys = blobs.map((b) => b.key).sort().reverse().slice(0, limit);
+
+  const out: LeadFinderProfile[] = [];
+  for (const k of indexKeys) {
+    const idx = (await store.get(k, { type: "json" })) as { id?: string } | null;
+    const id = safeText(idx?.id);
+    if (!id) continue;
+
+    const p = (await store.get(profileKey(id), { type: "json" })) as LeadFinderProfile | null;
+    if (p) out.push(p);
+  }
+
+  return out;
+}
+
+async function createRun(
+  store: ReturnType<typeof getStore>,
+  input: { profileId: string; provider: LeadFinderProvider; actor: string },
+): Promise<LeadFinderRun> {
+  for (let i = 0; i < 5; i += 1) {
+    const id = crypto.randomUUID();
+    const now = nowIso();
+    const tsKey = tsKeyNow();
+
+    const run: LeadFinderRun = {
+      id,
+      createdAt: now,
+      updatedAt: now,
+      requestedBy: input.actor,
+
+      profileId: input.profileId,
+      provider: input.provider,
+      status: "queued",
+
+      statsTotalSeen: 0,
+      statsQualified: 0,
+      statsInserted: 0,
+      statsDuplicates: 0,
+      statsMissingPhone: 0,
+      statsHasWebsite: 0,
+
+      errorMessage: null,
+    };
+
+    const res = await store.setJSON(runKey(id), run, { onlyIfNew: true });
+    if (!res.modified) continue;
+
+    await store.setJSON(runIndexKey(tsKey, id), { id, createdAt: now }, { onlyIfNew: true });
+    return run;
+  }
+
+  throw new Error("failed_to_create_run");
+}
+
+async function listRuns(store: ReturnType<typeof getStore>, limit: number): Promise<LeadFinderRun[]> {
+  const { blobs } = await store.list({ prefix: "lead_finder/indexes/runs/" });
+  const indexKeys = blobs.map((b) => b.key).sort().reverse().slice(0, limit);
+
+  const out: LeadFinderRun[] = [];
+  for (const k of indexKeys) {
+    const idx = (await store.get(k, { type: "json" })) as { id?: string } | null;
+    const id = safeText(idx?.id);
+    if (!id) continue;
+
+    const r = (await store.get(runKey(id), { type: "json" })) as LeadFinderRun | null;
+    if (r) out.push(r);
+  }
+  return out;
+}
+
+async function patchRun(
+  store: ReturnType<typeof getStore>,
+  id: string,
+  updater: (run: LeadFinderRun) => LeadFinderRun,
+): Promise<LeadFinderRun> {
+  for (let i = 0; i < 5; i += 1) {
+    const existing = (await store.getWithMetadata(runKey(id), { type: "json" })) as
+      | { data: LeadFinderRun; etag: string }
+      | null;
+
+    if (!existing) throw new Error("run_not_found");
+
+    const next = updater(existing.data);
+    const res = await store.setJSON(runKey(id), next, { onlyIfMatch: existing.etag });
+    if (res.modified) return next;
+  }
+  throw new Error("run_update_conflict");
+}
+
+function buildSimulatedLead(args: { id: string; actor: string; profile: LeadFinderProfile; idx: number }): CrmLead {
+  const now = nowIso();
+  const city = args.profile.city ? ` (${args.profile.city})` : "";
   return {
-    provider: b.provider,
-    providerPlaceId: b.providerPlaceId,
-    businessName: b.businessName.trim(),
-    phoneRaw: b.phoneRaw,
-    phoneE164: normalizePhoneToE164(b.phoneRaw),
-    websiteUrl: normalizeWebsite(b.websiteUrl),
-    addressFull: b.addressFull?.trim() ?? null,
+    id: args.id,
+    createdAt: now,
+    updatedAt: now,
+    updatedBy: args.actor,
+    source: "public",
+    status: "new",
+    name: `${args.profile.name} Lead #${args.idx + 1}${city}`,
+    phone: `+1206555${String(1000 + (args.idx % 9000)).padStart(4, "0")}`,
+    service: args.profile.industryId,
+    notes: `lead_finder: profile=${args.profile.id}`,
+    timeline: [{ at: now, type: "lead_finder_inserted" }],
   };
 }
 
-function normalizeWebsite(url: string | null): string | null {
-  if (!url) return null;
-  const trimmed = url.trim();
-  if (!trimmed) return null;
+/* --------------------------------- Auth --------------------------------- */
+
+function requireAuth(authHeader: string): { ok: true; payload: JwtPayload } | { ok: false } {
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : "";
+  if (!token) return { ok: false };
+
+  const secret = envGet("JWT_SECRET") ?? "";
+  if (!secret) return { ok: false };
+
+  const payload = verifyJwt(secret, token);
+  if (!payload) return { ok: false };
+
+  return { ok: true, payload };
+}
+
+function verifyJwt(secret: string, token: string): JwtPayload | null {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+
+  const [h, p, s] = parts;
+  const data = `${h}.${p}`;
+  const expected = hmacSha256(secret, data);
+  if (!timingSafeEqualStr(expected, s)) return null;
+
   try {
-    const u = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
-    u.hash = "";
-    return u.toString();
+    const payload = JSON.parse(b64urlDecode(p)) as JwtPayload;
+    if (typeof payload?.exp !== "number" || nowSec() > payload.exp) return null;
+    if (typeof payload?.sub !== "string") return null;
+    if (payload.role !== "admin" && payload.role !== "staff") return null;
+    return payload;
   } catch {
-    return trimmed;
+    return null;
   }
 }
 
-/**
- * Minimal phone normalizer.
- * Replace with libphonenumber if you need full international support.
- */
-function normalizePhoneToE164(phoneRaw: string | null): string | null {
-  if (!phoneRaw) return null;
-  const digits = phoneRaw.replace(/[^\d+]/g, "");
-  if (!digits) return null;
-  if (digits.startsWith("+")) return digits;
-  // Assumes US default if no country code; adjust to your CRM locale rules.
-  if (digits.length === 10) return `+1${digits}`;
+/* ------------------------------ HTTP Helpers ---------------------------- */
+
+function normalizeFnPath(pathname: string): string {
+  const prefix = "/.netlify/functions/lead_finder";
+  if (pathname.startsWith(prefix)) {
+    const rest = pathname.slice(prefix.length);
+    return (rest || "/").replaceAll("//", "/");
+  }
+  return pathname.replaceAll("//", "/");
+}
+
+function buildCorsHeaders(req: Request): Headers {
+  const h = new Headers();
+  h.set("access-control-allow-origin", "*");
+  h.set("access-control-allow-methods", "GET,POST,OPTIONS");
+  h.set(
+    "access-control-allow-headers",
+    req.headers.get("access-control-request-headers") ?? "content-type,authorization",
+  );
+  h.set("access-control-max-age", "86400");
+  return h;
+}
+
+function respondJson(data: unknown, status: number, corsHeaders: Headers): Response {
+  const headers = new Headers(corsHeaders);
+  headers.set("content-type", "application/json; charset=utf-8");
+  return new Response(JSON.stringify(data), { status, headers });
+}
+
+async function safeJson(req: Request): Promise<any | null> {
+  const ct = req.headers.get("content-type") ?? "";
+  if (!ct.toLowerCase().includes("application/json")) return null;
+  try {
+    return await req.json();
+  } catch {
+    return null;
+  }
+}
+
+/* ------------------------------ Small Utils ----------------------------- */
+
+function envGet(key: string): string | null {
+  const v1 = process.env[key];
+  if (typeof v1 === "string" && v1.length) return v1;
+
+  const n = (globalThis as any)?.Netlify?.env?.get?.(key);
+  if (typeof n === "string" && n.length) return n;
+
   return null;
 }
 
-//// file: src/lead-finder/provider/googlePlaces.ts
-import type { LeadFinderProfile, ProviderBusiness } from "../types.js";
-
-/**
- * Connector boundary.
- * Implement with the official Google Places API in your codebase.
- */
-export interface PlacesClient {
-  searchBusinesses(input: {
-    query: string;
-    centerLat: number;
-    centerLng: number;
-    radiusMeters: number;
-    pageToken?: string | null;
-  }): Promise<{ results: Array<Omit<ProviderBusiness, "provider">>; nextPageToken: string | null }>;
+function nowIso(): string {
+  return new Date().toISOString();
 }
 
-export async function* searchAllBusinesses(
-  places: PlacesClient,
-  profile: LeadFinderProfile,
-  query: string,
-): AsyncGenerator<ProviderBusiness> {
-  if (profile.centerLat == null || profile.centerLng == null) {
-    throw new Error("lat/lng required for provider search");
+function nowSec(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function b64urlDecode(input: string): string {
+  const pad = input.length % 4 === 0 ? "" : "=".repeat(4 - (input.length % 4));
+  const b64 = input.replaceAll("-", "+").replaceAll("_", "/") + pad;
+  return Buffer.from(b64, "base64").toString("utf8");
+}
+
+function hmacSha256(secret: string, data: string): string {
+  const sig = crypto.createHmac("sha256", secret).update(data).digest("base64");
+  return sig.replaceAll("=", "").replaceAll("+", "-").replaceAll("/", "_");
+}
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+function safeText(v: any): string {
+  return typeof v === "string" ? v.trim() : "";
+}
+
+function requiredString(v: any): string | null {
+  const s = typeof v === "string" ? v.trim() : "";
+  return s.length ? s : null;
+}
+
+function optionalString(v: any): string | null {
+  const s = typeof v === "string" ? v.trim() : "";
+  return s.length ? s : null;
+}
+
+function optionalNumber(v: any): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim()) {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
   }
+  return null;
+}
 
-  let pageToken: string | null = null;
-  for (;;) {
-    const page = await places.searchBusinesses({
-      query,
-      centerLat: profile.centerLat,
-      centerLng: profile.centerLng,
-      radiusMeters: profile.radiusMeters,
-      pageToken,
-    });
-
-    for (const r of page.results) {
-      yield { ...r, provider: "google_places" };
-    }
-
-    if (!page.nextPageToken) break;
-    pageToken = page.nextPageToken;
+function optionalBool(v: any): boolean | null {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === "true") return true;
+    if (s === "false") return false;
   }
+  return null;
 }
 
-//// file: src/lead-finder/service.ts
-import type { Pool } from "pg";
-import type { LeadFinderProfile, LeadFinderRun, PlacesClient, ProviderBusiness, RunItemDecision } from "./types.js";
-import { normalizeBusiness } from "./normalize.js";
-import { LeadFinderRepo } from "./db/repo.js";
-import { searchAllBusinesses } from "./provider/googlePlaces.js";
-
-export class LeadFinderService {
-  private readonly repo: LeadFinderRepo;
-
-  constructor(
-    private readonly pool: Pool,
-    private readonly placesClient: PlacesClient,
-  ) {
-    this.repo = new LeadFinderRepo(pool);
-  }
-
-  async runOnce(run: LeadFinderRun): Promise<void> {
-    const profile = await this.repo.getProfile(run.profileId);
-    if (!profile) throw new Error(`profile not found: ${run.profileId}`);
-
-    const query = buildQuery(profile);
-    for await (const business of searchAllBusinesses(this.placesClient, profile, query)) {
-      await this.processBusiness(run.id, profile, business);
-      const latest = await this.repo.getRun(run.id);
-      if (latest?.status === "cancelled") return;
-    }
-  }
-
-  private async processBusiness(runId: string, profile: LeadFinderProfile, business: ProviderBusiness) {
-    const b = normalizeBusiness(business);
-    await this.repo.bumpRunStats(runId, { statsTotalSeen: 1 });
-
-    const decision = qualify(profile, b);
-    if (decision !== "inserted") {
-      await this.repo.bumpRunStats(runId, bumpForDecision(decision));
-      await this.withTx(async (client) => {
-        await this.repo.insertLeadAndAudit(client, runId, profile, b, decision);
-      });
-      return;
-    }
-
-    await this.repo.bumpRunStats(runId, { statsQualified: 1 });
-
-    await this.withTx(async (client) => {
-      const dup = await this.repo.isDuplicate(client, {
-        provider: b.provider,
-        providerPlaceId: b.providerPlaceId,
-        phoneE164: b.phoneE164,
-        name: b.businessName,
-        addressFull: b.addressFull,
-      });
-
-      if (dup) {
-        await this.repo.bumpRunStats(runId, { statsDuplicates: 1 });
-        await this.repo.insertLeadAndAudit(client, runId, profile, b, "skipped_duplicate");
-        return;
-      }
-
-      const leadId = await this.repo.createColdLead(client, runId, profile, b);
-      await this.repo.bumpRunStats(runId, { statsInserted: 1 });
-      await this.repo.insertLeadAndAudit(client, runId, profile, b, "inserted", leadId);
-    });
-  }
-
-  private async withTx<T>(fn: (client: import("pg").PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query("begin");
-      const out = await fn(client);
-      await client.query("commit");
-      return out;
-    } catch (e) {
-      await client.query("rollback");
-      throw e;
-    } finally {
-      client.release();
-    }
-  }
+function clampInt(v: string | null | undefined, min: number, max: number, def: number): number {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  const i = Math.floor(n);
+  return Math.min(max, Math.max(min, i));
 }
-
-function qualify(profile: LeadFinderProfile, b: ReturnType<typeof normalizeBusiness>): RunItemDecision {
-  if (profile.requirePhone && !b.phoneE164) return "skipped_missing_phone";
-  if (profile.requireNoWebsite && !!b.websiteUrl) return "skipped_has_website";
-  if (!b.businessName || !b.providerPlaceId) return "skipped_invalid";
-  return "inserted";
-}
-
-function bumpForDecision(decision: RunItemDecision) {
-  if (decision === "skipped_missing_phone") return { statsMissingPhone: 1 };
-  if (decision === "skipped_has_website") return { statsHasWebsite: 1 };
-  return {};
-}
-
-function buildQuery(profile: LeadFinderProfile) {
-  const base = profile.subIndustryId ? `sub:${profile.subIndustryId}` : `industry:${profile.industryId}`;
-  return base;
-}
-
-//// file: src/lead-finder/routes.ts
-import type { Request, Response } from "express";
-import { Router } from "express";
-import { LeadFinderRepo } from "./db/repo.js";
-
-export function createLeadFinderRouter(deps: { repo: LeadFinderRepo }) {
-  const r = Router();
-
-  r.post("/runs", async (req: Request, res: Response) => {
-    const { profileId, provider } = req.body ?? {};
-    const requestedByUserId = req.header("x-user-id") ?? "unknown";
-
-    if (!profileId) return res.status(400).json({ error: "profileId required" });
-    const run = await deps.repo.createRun({
-      profileId,
-      requestedByUserId,
-      provider: provider ?? "google_places",
-    });
-
-    return res.status(201).json({ runId: run.id, status: run.status });
-  });
-
-  r.get("/runs/:runId", async (req: Request, res: Response) => {
-    const run = await deps.repo.getRun(req.params.runId);
-    if (!run) return res.status(404).json({ error: "not found" });
-    return res.json(run);
-  });
-
-  r.post("/runs/:runId/cancel", async (req: Request, res: Response) => {
-    const ok = await deps.repo.cancelRun(req.params.runId);
-    return res.status(ok ? 200 : 409).json({ cancelled: ok });
-  });
-
-  return r;
-}
-
-//// file: src/lead-finder/worker.ts
-import { createPgPool } from "./db/pool.js";
-import { LeadFinderRepo } from "./db/repo.js";
-import { LeadFinderService } from "./service.js";
-import type { PlacesClient } from "./provider/googlePlaces.js";
-
-/**
- * Worker entrypoint.
- * Run as: node dist/lead-finder/worker.js
- */
-async function main() {
-  const provider = (process.env.LEAD_FINDER_PROVIDER ?? "google_places") as const;
-  const pollMs = Number(process.env.LEAD_FINDER_POLL_MS ?? "1000");
-
-  const pool = createPgPool();
-  const repo = new LeadFinderRepo(pool);
-
-  const placesClient: PlacesClient = {
-    async searchBusinesses() {
-      throw new Error("Implement PlacesClient.searchBusinesses with your Google Places integration");
-    },
-  };
-
-  const service = new LeadFinderService(pool, placesClient);
-
-  for (;;) {
-    const run = await repo.claimNextQueuedRun(provider);
-    if (!run) {
-      await sleep(pollMs);
-      continue;
-    }
-
-    try {
-      await service.runOnce(run);
-      const latest = await repo.getRun(run.id);
-      if (latest?.status !== "cancelled") {
-        await repo.setRunStatus(run.id, "completed");
-      }
-    } catch (e: any) {
-      await repo.setRunStatus(run.id, "failed", e?.message ?? "unknown error");
-    }
-  }
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-main().catch((e) => {
-  // eslint-disable-next-line no-console
-  console.error(e);
-  process.exit(1);
-});
-
-//// file: src/api.ts
-import express from "express";
-import { createPgPool } from "./lead-finder/db/pool.js";
-import { LeadFinderRepo } from "./lead-finder/db/repo.js";
-import { createLeadFinderRouter } from "./lead-finder/routes.js";
-
-const app = express();
-app.use(express.json());
-
-const pool = createPgPool();
-const repo = new LeadFinderRepo(pool);
-
-/**
- * api.ts only wires routes. No Lead Finder logic lives here.
- */
-app.use("/lead-finder", createLeadFinderRouter({ repo }));
-
-app.listen(process.env.PORT ?? 3000);
-
-//// file: src/lead-finder/migrations.sql
-/**
-create table if not exists lead_finder_profiles (
-  id uuid primary key default gen_random_uuid(),
-  name text not null,
-  industry_id uuid not null,
-  sub_industry_id uuid null,
-  geo_type text not null,
-  city text null,
-  state text null,
-  country text null,
-  center_lat double precision null,
-  center_lng double precision null,
-  radius_meters int not null,
-  require_phone boolean not null default true,
-  require_no_website boolean not null default true,
-  created_by_user_id uuid not null,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
-
-create table if not exists lead_finder_runs (
-  id uuid primary key default gen_random_uuid(),
-  profile_id uuid not null references lead_finder_profiles(id),
-  status text not null,
-  provider text not null,
-  requested_by_user_id uuid not null,
-  started_at timestamptz null,
-  finished_at timestamptz null,
-  stats_total_seen int not null default 0,
-  stats_qualified int not null default 0,
-  stats_inserted int not null default 0,
-  stats_duplicates int not null default 0,
-  stats_missing_phone int not null default 0,
-  stats_has_website int not null default 0,
-  error_message text null,
-  created_at timestamptz not null default now()
-);
-
-create table if not exists lead_finder_run_items (
-  id uuid primary key default gen_random_uuid(),
-  run_id uuid not null references lead_finder_runs(id),
-  provider text not null,
-  provider_place_id text not null,
-  business_name text not null,
-  phone_raw text null,
-  phone_e164 text null,
-  website_url text null,
-  address_full text null,
-  decision text not null,
-  lead_id uuid null,
-  created_at timestamptz not null default now()
-);
-
-create table if not exists lead_external_ids (
-  id uuid primary key default gen_random_uuid(),
-  lead_id uuid not null,
-  provider text not null,
-  provider_place_id text not null,
-  unique (provider, provider_place_id)
-);
-
-create table if not exists lead_dedupe_keys (
-  id uuid primary key default gen_random_uuid(),
-  lead_id uuid not null,
-  key_type text not null,
-  dedupe_key text not null,
-  unique (key_type, dedupe_key)
-);
-*/
