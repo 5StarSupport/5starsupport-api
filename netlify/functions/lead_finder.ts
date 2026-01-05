@@ -35,6 +35,8 @@ type LeadFinderProfile = {
 
   requirePhone: boolean;
   requireNoWebsite: boolean;
+  preferSlowSite: boolean;
+  slowMs: number | null;
 };
 
 type LeadFinderRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -171,6 +173,8 @@ export default async function handler(req: Request, _context: Context) {
     const radiusMeters = clampInt(String(body?.radiusMeters ?? ""), 1, 200_000, 5_000);
     const requirePhone = optionalBool(body?.requirePhone) ?? true;
     const requireNoWebsite = optionalBool(body?.requireNoWebsite) ?? true;
+    const preferSlowSite = optionalBool(body?.preferSlowSite) ?? false;
+    const slowMs = clampInt(String(body?.slowMs ?? ""), 250, 60_000, 2500);
 
     if (!name) return respondJson({ error: "missing_name" }, 400, cors);
     if (!industryId) return respondJson({ error: "missing_industryId" }, 400, cors);
@@ -196,6 +200,8 @@ export default async function handler(req: Request, _context: Context) {
       radiusMeters,
       requirePhone,
       requireNoWebsite,
+      preferSlowSite,
+      slowMs: preferSlowSite ? slowMs : null,
       actor: auth.payload.sub,
     });
 
