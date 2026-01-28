@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "updatedAt": "2026-01-28T12:34:04Z",
+  "vehicles": [
+    {
+      "id": "PA-2001",
+      "type": "SUV",
+      "title": "2024 BMW X5 xDrive40i",
+      "price": "$62,900",
+      "meta": [
+        "12k mi",
+        "AWD",
+        "Premium Package"
+      ],
+      "img": "",
+      "year": 2024,
+      "make": "BMW",
+      "model": "",
+      "trim": "",
+      "mileage": 12410,
+      "color": "White",
+      "mpg": 22,
+      "cyl": 6,
+      "transmission": "Automatic",
+      "fuel": "Gas",
+      "drivetrain": "AWD",
+      "bodyType": "SUV",
+      "vin": "",
+      "modelCode": "",
+      "interiorColor": "",
+      "exteriorColor": "White",
+      "featured": true,
+      "features": [
+        "Navigation",
+        "Sunroof"
+      ],
+      "highlightedFeatures": [
+        "Navigation",
+        "Sunroof"
+      ],
+      "images": [],
+      "createdAt": "2026-01-28T12:34:04Z",
+      "updatedAt": "2026-01-28T12:34:04Z",
+      "deletedAt": null
+    }
+  ]
+}
