@@ -3,3 +3,7 @@ node_modules/
 
 # Local Netlify folder
 .netlify
+
+# Netlify CLI artifacts
+.netlify/
+
