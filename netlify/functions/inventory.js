@@ -5,7 +5,7 @@ const path = require("node:path");
 
 const { json, getAuthRole, getDataStore, safeParseJson, nowIso } = require("./_utils");
 
-exports.config = { path: "/api/inventory/*" };
+exports.config = { path: ["/api/inventory", "/api/inventory/*"] };
 
 const INVENTORY_KEY = "inventory:v1";
 const IMAGE_KEY_PREFIX = "inventory:image:";
