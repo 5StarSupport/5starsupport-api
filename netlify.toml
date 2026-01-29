@@ -1,5 +1,21 @@
 [build]
+  publish = "."
+  functions = "netlify/functions"
+
+[dev]
+  port = 8888
   functions = "netlify/functions"
 
 [functions]
   node_bundler = "esbuild"
+  included_files = ["netlify/functions/_seed/**"]
+
+[[redirects]]
+  from = "/api/inventory"
+  to = "/.netlify/functions/inventory"
+  status = 200
+
+[[redirects]]
+  from = "/api/inventory/*"
+  to = "/.netlify/functions/inventory/:splat"
+  status = 200

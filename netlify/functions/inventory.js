@@ -46,23 +46,44 @@ function parsePath(event) {
 }
 
 function readSeedDoc() {
-  const seedPath = path.join(__dirname, "_seed", "inventory.json");
-  const raw = fs.readFileSync(seedPath, "utf8");
-  const doc = safeParseJson(raw);
+  // Use require() so bundlers (esbuild) include the JSON.
+  // This avoids ENOENT when __dirname points to the built functions directory.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const doc = require("./_seed/inventory.json");
   if (!doc || typeof doc !== "object" || !Array.isArray(doc.vehicles)) {
     throw new Error("Bad seed inventory.json");
   }
   return doc;
 }
 
+
 async function loadInventoryDoc(store) {
-  const existing = await store.get(INVENTORY_KEY, { type: "json" });
+  let existing = null;
+
+  try {
+    existing = await store.get(INVENTORY_KEY, { type: "json" });
+  } catch (err) {
+    // If the stored value is corrupted (e.g. "[object Object]"), reseed from disk.
+    const seed = readSeedDoc();
+    try {
+      await store.set(INVENTORY_KEY, seed, { type: "json" });
+    } catch (_) {
+      // If persistence is unavailable, still return a usable doc.
+    }
+    return seed;
+  }
+
   if (existing && typeof existing === "object" && Array.isArray(existing.vehicles)) return existing;
 
   const seed = readSeedDoc();
-  await store.set(INVENTORY_KEY, seed, { type: "json" });
+  try {
+    await store.set(INVENTORY_KEY, seed, { type: "json" });
+  } catch (_) {
+    // If persistence is unavailable, still return a usable doc.
+  }
   return seed;
 }
+
 
 async function saveInventoryDoc(store, doc) {
   const next = {
